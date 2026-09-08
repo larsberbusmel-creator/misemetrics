@@ -12026,13 +12026,13 @@ function ProfitabilityReport({ data, month, productUnitCost, updateInventoryRpc,
         </p>
 
         <div className="form-grid three">
-          <label>Mat-salg netto eks. mva (ekskl. deli)
+          <label>Mat-salg netto eks. mva (kr, ekskl. deli)
             <input type="number" value={profitability.matSalesNetto || ""} disabled={readOnly} onChange={(e) => updateProfitability({ matSalesNetto: Number(e.target.value) || 0 })} placeholder="0" />
           </label>
-          <label>Deli-salg netto eks. mva
+          <label>Deli-salg netto eks. mva (kr)
             <input type="number" value={profitability.deliSalesNetto || ""} disabled={readOnly} onChange={(e) => updateProfitability({ deliSalesNetto: Number(e.target.value) || 0 })} placeholder="0" />
           </label>
-          <label>Varekjøp mat totalt (fra regnskap, mat+deli samlet)
+          <label>Varekjøp mat totalt (kr, fra regnskap, mat+deli samlet)
             <input type="number" value={profitability.varekjopMatTotalt || ""} disabled={readOnly} onChange={(e) => updateProfitability({ varekjopMatTotalt: Number(e.target.value) || 0 })} placeholder="F.eks. 600000" />
           </label>
         </div>
@@ -22186,6 +22186,98 @@ function ReportsTab({ data, updateData, productUnitCost, updateInventoryRpc, rea
   const [periodTo, setPeriodTo] = useState("");
   const [unmatchedSelections, setUnmatchedSelections] = useState<Record<string, string>>({});
   const [reportMonth, setReportMonth] = useState(new Date().toISOString().slice(0, 7));
+  const [showCrossProductStats, setShowCrossProductStats] = useState(false);
+  const [crossStatsFrom, setCrossStatsFrom] = useState("");
+  const [crossStatsTo, setCrossStatsTo] = useState("");
+  const [crossStatsSourceOrders, setCrossStatsSourceOrders] = useState(true);
+  const [crossStatsSourceRental, setCrossStatsSourceRental] = useState(true);
+  const [crossStatsSourceProduction, setCrossStatsSourceProduction] = useState(true);
+  const [crossStatsOrderType, setCrossStatsOrderType] = useState("");
+  const [crossStatsCategory, setCrossStatsCategory] = useState("");
+
+  function recommendedPriceAtVat(costExVat: number, marginPercent: number, vatRate: number) {
+    const margin = Number(marginPercent || 0) / 100;
+    if (margin >= 1) return 0;
+    return Math.ceil((costExVat / (1 - margin)) * (1 + vatRate / 100));
+  }
+
+  function crossStatsOrderQuantities(fromDate: string, toDate: string, orderTypeFilter: string) {
+    const result: Record<string, number> = {};
+    (data.orders || []).forEach((o) => {
+      if (o.deletedAt) return;
+      if (o.type === "storkjokken") return;
+      if (orderTypeFilter && o.type !== orderTypeFilter) return;
+      const from = o.date;
+      const to = o.endDate || o.date;
+      if (fromDate && to < fromDate) return;
+      if (toDate && from > toDate) return;
+      (o.orderLines || []).forEach((line) => {
+        result[line.productId] = (result[line.productId] || 0) + Number(line.quantity || 0);
+      });
+    });
+    return result;
+  }
+
+  function crossStatsRentalQuantities(fromDate: string, toDate: string) {
+    const result: Record<string, number> = {};
+    (data.rentalOffers || []).forEach((r) => {
+      if (!r.date) return;
+      const from = r.date;
+      const to = r.endDate || r.date;
+      if (fromDate && to < fromDate) return;
+      if (toDate && from > toDate) return;
+      (r.productLines || []).forEach((line) => {
+        result[line.productId] = (result[line.productId] || 0) + Number(line.guests || 0);
+      });
+    });
+    return result;
+  }
+
+  function crossStatsProductionQuantities(fromDate: string, toDate: string) {
+    const result: Record<string, number> = {};
+    Object.values(data.bakeryProductionDays || {}).forEach((day) => {
+      if (!day.approved) return;
+      if (fromDate && day.date < fromDate) return;
+      if (toDate && day.date > toDate) return;
+      Object.entries(day.quantities || {}).forEach(([productId, byCustomer]) => {
+        const qty = Object.values(byCustomer || {}).reduce((s: number, q) => s + Number(q || 0), 0);
+        result[productId] = (result[productId] || 0) + qty;
+      });
+    });
+    (data.storkjokkenPickupOrders || []).forEach((p) => {
+      if (fromDate && p.date < fromDate) return;
+      if (toDate && p.date > toDate) return;
+      result[p.productId] = (result[p.productId] || 0) + Number(p.quantity || 0);
+    });
+    return result;
+  }
+
+  function crossProductStatsRows() {
+    const orderQty = crossStatsSourceOrders ? crossStatsOrderQuantities(crossStatsFrom, crossStatsTo, crossStatsOrderType) : {};
+    const rentalQty = crossStatsSourceRental ? crossStatsRentalQuantities(crossStatsFrom, crossStatsTo) : {};
+    const productionQty = crossStatsSourceProduction ? crossStatsProductionQuantities(crossStatsFrom, crossStatsTo) : {};
+    const allIds = new Set([...Object.keys(orderQty), ...Object.keys(rentalQty), ...Object.keys(productionQty)]);
+    return data.products
+      .filter((p) => allIds.has(p.id))
+      .filter((p) => !crossStatsCategory || p.category === crossStatsCategory)
+      .map((p) => {
+        const quantity = (orderQty[p.id] || 0) + (rentalQty[p.id] || 0) + (productionQty[p.id] || 0);
+        const cost = productUnitCost(p);
+        const price15 = recommendedPriceAtVat(cost, p.targetMargin, data.settings.foodVat);
+        const price25 = recommendedPriceAtVat(cost, p.targetMargin, data.settings.alcoholVat ?? 25);
+        return { productId: p.id, productName: p.name, quantity, cost, price15, price25 };
+      })
+      .filter((r) => r.quantity > 0)
+      .sort((a, b) => b.quantity - a.quantity);
+  }
+
+  const crossStatsOrderTypeOptions: { value: Order["type"]; label: string }[] = [
+    { value: "catering", label: "Catering" },
+    { value: "bakeri", label: "Bakst" },
+    { value: "pasmuurt", label: "Påsmurt" },
+    { value: "egenprodusert", label: "Egenprodusert" },
+  ];
+  const crossStatsCategoryOptions = Array.from(new Set(data.products.map((p) => p.category).filter(Boolean))).sort();
 
   async function handleFileUpload(file: File | null) {
     if (!file) return;
@@ -22709,6 +22801,70 @@ function ReportsTab({ data, updateData, productUnitCost, updateInventoryRpc, rea
         <ProfitabilityReport data={data} month={reportMonth} productUnitCost={productUnitCost} updateInventoryRpc={updateInventoryRpc} readOnly={readOnly} />
         <InventoryVarianceReport data={data} month={reportMonth} productUnitCost={productUnitCost} />
       </div>
+
+      <div style={{ marginTop: 16 }}>
+        <button className="btn active" onClick={() => setShowCrossProductStats((v) => !v)}>
+          {showCrossProductStats ? "Skjul produktstatistikk" : "Produktstatistikk (Ordre / Leie av lokale / Produksjon)"}
+        </button>
+      </div>
+
+      {showCrossProductStats && (() => {
+        const rows = crossProductStatsRows();
+        return (
+          <div className="card" style={{ marginTop: 16 }}>
+            <h3>Produktstatistikk – Ordre, Leie av lokale og Produksjon</h3>
+            <p style={{ color: "#64748b", fontSize: 13 }}>
+              Viser antall solgt/brukt per produkt, summert på tvers av de påslåtte kildene under. Storkjøkken-ordre telles ikke med her - se Produksjon-fanen for de tallene.
+            </p>
+            <div className="form-grid two">
+              <label>Fra dato<input type="date" value={crossStatsFrom} onChange={(e) => setCrossStatsFrom(e.target.value)} /></label>
+              <label>Til dato<input type="date" value={crossStatsTo} onChange={(e) => setCrossStatsTo(e.target.value)} /></label>
+            </div>
+            <div className="chips" style={{ marginTop: 8 }}>
+              <button className={crossStatsSourceOrders ? "btn active" : "btn"} onClick={() => setCrossStatsSourceOrders((v) => !v)}>Ordre</button>
+              <button className={crossStatsSourceRental ? "btn active" : "btn"} onClick={() => setCrossStatsSourceRental((v) => !v)}>Leie av lokale</button>
+              <button className={crossStatsSourceProduction ? "btn active" : "btn"} onClick={() => setCrossStatsSourceProduction((v) => !v)}>Produksjon</button>
+            </div>
+            <div className="form-grid two" style={{ marginTop: 8 }}>
+              <label>Ordretype (gjelder kun Ordre-kilden)
+                <select value={crossStatsOrderType} disabled={!crossStatsSourceOrders} onChange={(e) => setCrossStatsOrderType(e.target.value)}>
+                  <option value="">Alle typer (unntatt storkjøkken)</option>
+                  {crossStatsOrderTypeOptions.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
+                </select>
+              </label>
+              <label>Produktkategori
+                <select value={crossStatsCategory} onChange={(e) => setCrossStatsCategory(e.target.value)}>
+                  <option value="">Alle kategorier</option>
+                  {crossStatsCategoryOptions.map((c) => <option key={c} value={c}>{c}</option>)}
+                </select>
+              </label>
+            </div>
+            <div style={{ overflow: "auto", marginTop: 12 }}>
+              <table>
+                <thead>
+                  <tr>
+                    <th>Produkt</th>
+                    <th style={{ textAlign: "right" }}>Antall totalt</th>
+                    <th style={{ textAlign: "right" }}>Varekost pr. enhet</th>
+                    <th style={{ textAlign: "right" }}>Anbefalt pris 15% / 25% mva</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {rows.map((r) => (
+                    <tr key={r.productId}>
+                      <td>{r.productName}</td>
+                      <td style={{ textAlign: "right" }}>{r.quantity}</td>
+                      <td style={{ textAlign: "right" }}>{currency(r.cost)}</td>
+                      <td style={{ textAlign: "right" }}>{currency(r.price15)} / {currency(r.price25)}</td>
+                    </tr>
+                  ))}
+                  {!rows.length && <tr><td colSpan={4} style={{ color: "#94a3b8" }}>Ingen produkter matcher valgte filtre/periode.</td></tr>}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        );
+      })()}
     </section>
   );
 }
