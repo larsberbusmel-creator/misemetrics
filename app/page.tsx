@@ -12473,8 +12473,195 @@ function VareregistreringPanel({ data, updateData, productUnitCost, readOnly }: 
     return "stk";
   }
 
+  // --- Estimert varelager ---
+  const lastLockedMonthKey = Object.keys(data.inventoryCounts || {})
+    .filter((mk) => data.inventoryCounts![mk]?.locked)
+    .sort()
+    .slice(-1)[0];
+
+  const sinceDate = (() => {
+    if (!lastLockedMonthKey) return "";
+    const [y, m] = lastLockedMonthKey.split("-").map(Number);
+    const d = new Date(y, m, 1); // første dag i måneden ETTER siste låste telling
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  })();
+
+  const todayStr = today();
+
+  function openingQuantity(itemType: "material" | "product", itemId: string): number {
+    if (!lastLockedMonthKey) return 0;
+    const items = data.inventoryCounts?.[lastLockedMonthKey]?.items || {};
+    if (itemType === "material") {
+      const c = items[itemId] as any;
+      if (!c) return 0;
+      const material = data.materials.find((m) => m.id === itemId);
+      return Number(c.packages || 0) * Number(material?.packageSize || 1) + Number(c.loose || 0);
+    }
+    const c = items[`product_${itemId}`] as any;
+    if (!c) return 0;
+    const product = data.products.find((p) => p.id === itemId);
+    return Number(c.packages || 0) * Number(product?.unitsPerCase || 1) + Number(c.loose || 0);
+  }
+
+  function transactionsQuantitySince(itemType: "material" | "product", itemId: string): number {
+    return (data.inventoryTransactions || [])
+      .filter((t) => t.itemType === itemType && t.itemId === itemId && (!sinceDate || t.date >= sinceDate))
+      .reduce((sum, t) => {
+        if (itemType === "material") {
+          const material = data.materials.find((m) => m.id === itemId);
+          return sum + Number(t.packages || 0) * Number(material?.packageSize || 1) + Number(t.loose || 0);
+        }
+        const product = data.products.find((p) => p.id === itemId);
+        return sum + Number(t.packages || 0) * Number(product?.unitsPerCase || 1) + Number(t.loose || 0);
+      }, 0);
+  }
+
+  function wasteQuantitySince(itemType: "material" | "product", itemId: string): number {
+    return (data.wasteLog || [])
+      .filter((w) => w.itemType === itemType && w.itemId === itemId && (!sinceDate || w.date >= sinceDate))
+      .reduce((sum, w) => sum + Number(w.quantity || 0), 0);
+  }
+
+  // Produsert/solgt/utleid antall PR. PRODUKT siden siste låste telling, på tvers av
+  // Produksjon/Ordre/Leie - samme kildegrunnlag som Rapporter-fanens "Produktstatistikk"
+  // (crossStatsOrderQuantities/crossStatsRentalQuantities/crossStatsProductionQuantities),
+  // skrevet lokalt her siden ReportsTab og InventoryTab ikke deler closures.
+  function producedQuantitiesSince(): Record<string, number> {
+    const result: Record<string, number> = {};
+    (data.orders || []).forEach((o) => {
+      if (o.deletedAt || o.type === "storkjokken") return;
+      const to = o.endDate || o.date;
+      if (sinceDate && to < sinceDate) return;
+      if (to > todayStr) return;
+      (o.orderLines || []).forEach((line) => { result[line.productId] = (result[line.productId] || 0) + Number(line.quantity || 0); });
+    });
+    (data.rentalOffers || []).forEach((r) => {
+      if (!r.date) return;
+      const to = r.endDate || r.date;
+      if (sinceDate && to < sinceDate) return;
+      if (to > todayStr) return;
+      (r.productLines || []).forEach((line) => { result[line.productId] = (result[line.productId] || 0) + Number(line.guests || 0); });
+    });
+    Object.values(data.bakeryProductionDays || {}).forEach((day) => {
+      if (!day.approved) return;
+      if (sinceDate && day.date < sinceDate) return;
+      if (day.date > todayStr) return;
+      Object.entries(day.quantities || {}).forEach(([productId, byCustomer]) => {
+        const qty = Object.values(byCustomer || {}).reduce((s: number, q) => s + Number(q || 0), 0);
+        result[productId] = (result[productId] || 0) + qty;
+      });
+    });
+    (data.storkjokkenPickupOrders || []).forEach((p) => {
+      if (sinceDate && p.date < sinceDate) return;
+      if (p.date > todayStr) return;
+      result[p.productId] = (result[p.productId] || 0) + Number(p.quantity || 0);
+    });
+    return result;
+  }
+
+  // Ett-nivås forbruksnedbryting - se forklaring øverst i denne prompten. Speiler samme
+  // vekt-/svinnjustering og recipeYieldAmount/unitWeightKg-normalisering som appens vanlige
+  // productMaterialConsumptionPerUnit (ReportsTab), men stopper VED et "product"-linjeitem.
+  function directConsumptionPerUnit(product: Product): Record<string, { itemType: "material" | "product"; amount: number }> {
+    const raw: Record<string, { itemType: "material" | "product"; amount: number }> = {};
+    function add(itemType: "material" | "product", itemId: string, amount: number) {
+      const existing = raw[itemId];
+      raw[itemId] = { itemType, amount: (existing?.amount || 0) + amount };
+    }
+    function walkRecipe(recipe: Recipe, amountUsed: number, visited: string[]) {
+      if (visited.includes(recipe.id)) return;
+      const totalAmount = recipe.lines.reduce((sum, l) => sum + Number(l.amount || 0), 0) || Number(recipe.yieldAmount || 1) || 1;
+      const scale = totalAmount > 0 ? amountUsed / totalAmount : 0;
+      recipe.lines.forEach((line) => {
+        const waste = Math.min(Number(line.wastePercent || 0), 95) / 100;
+        const baseAmount = Number(line.amount || 0) * scale;
+        const adjustedAmount = waste > 0 ? baseAmount / (1 - waste) : baseAmount;
+        if (line.itemType === "material") add("material", line.itemId, adjustedAmount);
+        else if (line.itemType === "recipe") {
+          const subRecipe = data.recipes.find((r) => r.id === line.itemId);
+          if (subRecipe) walkRecipe(subRecipe, adjustedAmount, [...visited, recipe.id]);
+        }
+      });
+    }
+    product.lines.forEach((line) => {
+      const waste = Math.min(Number(line.wastePercent || 0), 95) / 100;
+      const baseAmount = Number(line.amount || 0);
+      const adjustedAmount = waste > 0 ? baseAmount / (1 - waste) : baseAmount;
+      if (line.itemType === "material") add("material", line.itemId, adjustedAmount);
+      else if (line.itemType === "recipe") {
+        const recipe = data.recipes.find((r) => r.id === line.itemId);
+        if (recipe) walkRecipe(recipe, adjustedAmount, []);
+      } else if (line.itemType === "product") {
+        add("product", line.itemId, adjustedAmount);
+      }
+    });
+    const totalWeight = Number(product.recipeYieldAmount || 1) || 1;
+    const unitWeight = Number(product.unitWeightKg || 1) || 1;
+    const scale = unitWeight / totalWeight;
+    const result: Record<string, { itemType: "material" | "product"; amount: number }> = {};
+    Object.entries(raw).forEach(([id, v]) => { result[id] = { itemType: v.itemType, amount: v.amount * scale }; });
+    return result;
+  }
+
+  function consumptionQuantitySince(itemType: "material" | "product", itemId: string, producedQty: Record<string, number>): number {
+    let total = 0;
+    Object.entries(producedQty).forEach(([productId, qty]) => {
+      const product = data.products.find((p) => p.id === productId);
+      if (!product) return;
+      const perUnit = directConsumptionPerUnit(product);
+      const match = perUnit[itemId];
+      if (match && match.itemType === itemType) total += match.amount * qty;
+    });
+    return total;
+  }
+
+  const producedQtySince = producedQuantitiesSince();
+  const estimatedInventoryRows = [
+    ...data.materials.map((m) => ({ itemType: "material" as const, itemId: m.id, name: m.name, unitLabel: m.unit as string })),
+    ...data.products.filter((p) => egenprodusertCategories.includes(p.category)).map((p) => ({ itemType: "product" as const, itemId: p.id, name: p.name, unitLabel: "stk" })),
+  ]
+    .map((row) => {
+      const opening = openingQuantity(row.itemType, row.itemId);
+      const inn = transactionsQuantitySince(row.itemType, row.itemId);
+      const forbruk = consumptionQuantitySince(row.itemType, row.itemId, producedQtySince);
+      const svinn = wasteQuantitySince(row.itemType, row.itemId);
+      const estimated = opening + inn - forbruk - svinn;
+      return { ...row, opening, inn, forbruk, svinn, estimated };
+    })
+    .filter((r) => r.opening !== 0 || r.inn !== 0 || r.forbruk !== 0 || r.svinn !== 0)
+    .sort((a, b) => a.name.localeCompare(b.name, "no-NO"));
+
   return (
     <>
+      <div className="soft-box" style={{ marginBottom: 16 }}>
+        <h3 style={{ marginTop: 0 }}>Estimert varelager</h3>
+        <p className="muted" style={{ fontSize: 13 }}>
+          Beregnet ut fra siste låste varetelling{lastLockedMonthKey ? ` (${lastLockedMonthKey})` : " (ingen låst telling funnet ennå - viser kun registreringer siden start)"},
+          pluss vareleveranser/produksjon, minus beregnet forbruk (produksjon/ordre/leie) og registrert svinn siden da. Dette er et estimat, ikke en fasit - avstem alltid mot faktisk telling ved månedsslutt.
+        </p>
+        {estimatedInventoryRows.length === 0 ? (
+          <p className="muted">Ingen aktivitet å vise ennå - registrer en vareleveranse under, eller vent til neste låste telling.</p>
+        ) : (
+          <div style={{ overflowX: "auto" }}>
+            <table>
+              <thead><tr><th>Vare</th><th style={{ textAlign: "right" }}>Åpning</th><th style={{ textAlign: "right" }}>Inn</th><th style={{ textAlign: "right" }}>Forbruk</th><th style={{ textAlign: "right" }}>Svinn</th><th style={{ textAlign: "right" }}>Estimert nå</th></tr></thead>
+              <tbody>
+                {estimatedInventoryRows.map((r) => (
+                  <tr key={`${r.itemType}-${r.itemId}`}>
+                    <td>{r.name} {r.itemType === "product" && <span style={{ fontSize: 11, color: "#94a3b8" }}>egenprodusert</span>}</td>
+                    <td style={{ textAlign: "right" }}>{num(r.opening, 1)} {r.unitLabel}</td>
+                    <td style={{ textAlign: "right", color: "#166534" }}>+{num(r.inn, 1)}</td>
+                    <td style={{ textAlign: "right", color: "#92400e" }}>-{num(r.forbruk, 1)}</td>
+                    <td style={{ textAlign: "right", color: "#991b1b" }}>-{num(r.svinn, 1)}</td>
+                    <td style={{ textAlign: "right", fontWeight: 700 }}>{num(r.estimated, 1)} {r.unitLabel}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
       <div className="soft-box" style={{ marginBottom: 16 }}>
         <h3 style={{ marginTop: 0 }}>Legg til beholdning</h3>
         <p className="muted" style={{ fontSize: 13 }}>Registrer varemottak (innkjøp) eller egen produksjon av råvarer/egenproduserte varer.</p>
