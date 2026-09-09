@@ -9,6 +9,14 @@ const cache = new Map<string, { fetchedAt: number; payload: any }>();
 // MET krever en identifiserende User-Agent og avviser kall uten en gyldig en.
 const USER_AGENT = "Misemetrics/1.0 kontakt@misemetrics.app";
 
+// Frost (frost.met.no) er MET sitt ARKIV med faktisk OBSERVERTE (historiske)
+// værdata fra værstasjoner - til forskjell fra Locationforecast, som kun er
+// en fremover-prognose og ikke dekker dager som har passert. Krever en
+// gratis, selvregistrert klient-ID (se frost.met.no) satt som miljøvariabel
+// FROST_CLIENT_ID i Vercel. Uten den satt: fortsetter appen å virke akkurat
+// som før, historiske dager viser bare "ikke tilgjengelig" som tidligere.
+const FROST_CLIENT_ID = process.env.FROST_CLIENT_ID;
+
 function symbolToEmoji(code: string): string {
   if (!code) return "🌡️";
   if (code.includes("thunder")) return "⛈️";
@@ -35,6 +43,45 @@ function mapEntry(entry: any) {
   };
 }
 
+// Frost har INGEN værsymbol-taksonomi som Locationforecast (den er bygget for
+// automatiske målestasjoner, ikke prognoser) - dette er derfor en grov
+// tilnærming basert kun på temperatur+nedbør, IKKE like presis som det ekte
+// prognose-ikonet. Værvarsel-widgeten viser ellers samme layout som før.
+function frostEmoji(meanTemp: number | null, precipMm: number | null): string {
+  if (precipMm == null) return "🌡️";
+  if (precipMm > 0.2) return meanTemp != null && meanTemp <= 0 ? "❄️" : "🌧️";
+  return "☀️";
+}
+
+// Henter FAKTISK observert døgnmiddel-temperatur og døgn-nedbør for én
+// stasjon og én dato fra Frost. Returnerer null (ikke feil) hvis noe mangler
+// - kalleren faller da tilbake til vanlig "ikke tilgjengelig"-visning.
+async function fetchFrostDay(stationId: string, date: string) {
+  if (!FROST_CLIENT_ID) return null;
+  try {
+    const url = `https://frost.met.no/observations/v0.jsonld?sources=${encodeURIComponent(stationId)}&referencetime=${date}&elements=${encodeURIComponent("mean(air_temperature P1D),sum(precipitation_amount P1D)")}`;
+    const auth = Buffer.from(`${FROST_CLIENT_ID}:`).toString("base64");
+    const res = await fetch(url, { headers: { Authorization: `Basic ${auth}` } });
+    if (!res.ok) return null;
+    const json = await res.json();
+    const observations: any[] = json?.data?.[0]?.observations || [];
+    const tempObs = observations.find((o) => o.elementId === "mean(air_temperature P1D)");
+    const precipObs = observations.find((o) => o.elementId === "sum(precipitation_amount P1D)");
+    const temperature = tempObs?.value != null ? Number(tempObs.value) : null;
+    const precipitationMm = precipObs?.value != null ? Number(precipObs.value) : null;
+    if (temperature == null && precipitationMm == null) return null;
+    return {
+      current: { temperature, symbolCode: "", emoji: frostEmoji(temperature, precipitationMm), precipitationMm },
+      hourly: [] as any[],
+      date,
+      source: "frost",
+      fetchedAt: new Date().toISOString(),
+    };
+  } catch {
+    return null;
+  }
+}
+
 export async function GET(req: Request) {
   const { searchParams } = new URL(req.url);
   const lat = Number(searchParams.get("lat"));
@@ -44,6 +91,9 @@ export async function GET(req: Request) {
   // til cache-nøkkelen. Uten date: samme "nå + neste 8 timer"-oppførsel
   // som før (bakoverkompatibelt for evt. andre fremtidige kallere).
   const date = searchParams.get("date");
+  // Valgfri Frost-stasjons-ID (f.eks. "SN82290") for stedet - satt opp én
+  // gang per sted i Admin. Brukes KUN for dager i fortiden, se under.
+  const stationId = searchParams.get("stationId");
   if (!Number.isFinite(lat) || !Number.isFinite(lon)) {
     return NextResponse.json({ error: "Mangler eller ugyldig lat/lon" }, { status: 400 });
   }
@@ -55,6 +105,23 @@ export async function GET(req: Request) {
   const cached = cache.get(key);
   if (cached && Date.now() - cached.fetchedAt < CACHE_TTL_MS) {
     return NextResponse.json(cached.payload);
+  }
+
+  // For dager i FORTIDEN prøves Frost (faktisk observert vær) først, siden
+  // Locationforecast uansett kun dekker et fremover-vindu og vil returnere
+  // "ikke tilgjengelig" for alt annet enn de aller nyeste dagene bakover.
+  // Dagens dato/fremtidige dager går alltid via Locationforecast som før
+  // (prognosen skal fortsette å oppdatere seg helt frem til dagen selv).
+  const todayStr = new Date().toISOString().slice(0, 10);
+  if (date && stationId && date < todayStr) {
+    const frostPayload = await fetchFrostDay(stationId, date);
+    if (frostPayload) {
+      cache.set(key, { fetchedAt: Date.now(), payload: frostPayload });
+      return NextResponse.json(frostPayload);
+    }
+    // Frost hadde ingenting å by på (f.eks. manglende FROST_CLIENT_ID, eller
+    // stasjonen manglet data akkurat den dagen) - faller igjennom til vanlig
+    // Locationforecast-forsøk under, som uansett gir et konsistent svar.
   }
 
   try {

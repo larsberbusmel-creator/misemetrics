@@ -811,6 +811,7 @@ type Site = {
   weatherCity?: string; // vises som byens navn i værvarsel-widgeten på dashbordet
   weatherLat?: number; // koordinater trengs direkte - MET/Yr sitt API har ikke stedsnavn-oppslag
   weatherLon?: number;
+  weatherStationId?: string; // f.eks. "SN82290" - Frost sin stasjons-ID, kun for historisk (forbi) vær
 };
 
 type AppData = {
@@ -1444,12 +1445,12 @@ function SiteLogo({ path, fallbackSrc, alt, style }: { path?: string; fallbackSr
 }
 
 type WeatherHourly = { time: string; temperature: number | null; symbolCode: string; emoji: string; precipitationMm: number | null };
-type WeatherData = { current: { temperature: number | null; symbolCode: string; emoji: string }; hourly: WeatherHourly[] };
+type WeatherData = { current: { temperature: number | null; symbolCode: string; emoji: string; precipitationMm?: number | null }; hourly: WeatherHourly[] };
 
 // Delt henting/tilstand for /api/weather, gjenbrukt av både WeatherWidget
 // (dagsvisningen, følger selectedDate) og CompactWeatherLine (månedsvisningens
 // kompakte linje, alltid dagens dato) - unngår å duplisere fetch-logikken.
-function useWeatherForDate(lat: number | undefined, lon: number | undefined, date: string) {
+function useWeatherForDate(lat: number | undefined, lon: number | undefined, date: string, stationId?: string) {
   const [weather, setWeather] = useState<WeatherData | null>(null);
   const [loadError, setLoadError] = useState(false);
   const [unavailable, setUnavailable] = useState(false);
@@ -1460,7 +1461,7 @@ function useWeatherForDate(lat: number | undefined, lon: number | undefined, dat
     setUnavailable(false);
     if (lat == null || lon == null) return;
     let cancelled = false;
-    fetch(`/api/weather?lat=${lat}&lon=${lon}&date=${date}`)
+    fetch(`/api/weather?lat=${lat}&lon=${lon}&date=${date}${stationId ? `&stationId=${encodeURIComponent(stationId)}` : ""}`)
       .then((r) => r.json())
       .then((json) => {
         if (cancelled) return;
@@ -1512,7 +1513,7 @@ function bucketWeatherHourly(hourly: WeatherHourly[]) {
 function WeatherWidget({ site, setTab, selectedDate }: { site?: Site; setTab: (t: Tab) => void; selectedDate: string }) {
   const lat = site?.weatherLat;
   const lon = site?.weatherLon;
-  const { weather, loadError, unavailable } = useWeatherForDate(lat, lon, selectedDate);
+  const { weather, loadError, unavailable } = useWeatherForDate(lat, lon, selectedDate, site?.weatherStationId);
 
   if (lat == null || lon == null) {
     return (
@@ -1533,6 +1534,9 @@ function WeatherWidget({ site, setTab, selectedDate }: { site?: Site; setTab: (t
           <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 10 }}>
             <span style={{ fontSize: 32 }}>{weather.current.emoji}</span>
             <span style={{ fontSize: 28, fontWeight: 800 }}>{weather.current.temperature != null ? `${Math.round(weather.current.temperature)}°` : "-"}</span>
+            {weather.current.precipitationMm != null && (
+              <span style={{ fontSize: 13, color: "#64748b" }}>💧 {weather.current.precipitationMm} mm (observert døgnnedbør)</span>
+            )}
           </div>
           <div style={{ display: "flex", gap: 10 }}>
             {bucketWeatherHourly(weather.hourly).map((b) => (
@@ -21497,7 +21501,7 @@ function UsersTab({ data, updateData, allTabConfig, isSuperadmin, syncSharedData
   });
   const [form, setForm] = useState<UserAccessEntry>(emptyEntry());
 
-  const [siteForm, setSiteForm] = useState<{ name: string; enabledTabs: Tab[]; logoFile: File | null; weatherCity: string; weatherLat: string; weatherLon: string }>({ name: "", enabledTabs: [...ALL_TABS], logoFile: null, weatherCity: "", weatherLat: "", weatherLon: "" });
+  const [siteForm, setSiteForm] = useState<{ name: string; enabledTabs: Tab[]; logoFile: File | null; weatherCity: string; weatherLat: string; weatherLon: string; weatherStationId: string }>({ name: "", enabledTabs: [...ALL_TABS], logoFile: null, weatherCity: "", weatherLat: "", weatherLon: "", weatherStationId: "" });
   const [editingSiteId, setEditingSiteId] = useState<string | null>(null);
   const [siteBusy, setSiteBusy] = useState(false);
   const [siteFeedback, setSiteFeedback] = useState<{ type: "success" | "error"; text: string } | null>(null);
@@ -21658,13 +21662,13 @@ function UsersTab({ data, updateData, allTabConfig, isSuperadmin, syncSharedData
   }
 
   function startEditSite(s: Site) {
-    setSiteForm({ name: s.name, enabledTabs: [...s.enabledTabs], logoFile: null, weatherCity: s.weatherCity || "", weatherLat: String(s.weatherLat ?? ""), weatherLon: String(s.weatherLon ?? "") });
+    setSiteForm({ name: s.name, enabledTabs: [...s.enabledTabs], logoFile: null, weatherCity: s.weatherCity || "", weatherLat: String(s.weatherLat ?? ""), weatherLon: String(s.weatherLon ?? ""), weatherStationId: s.weatherStationId || "" });
     setEditingSiteId(s.id);
     setSiteFeedback(null);
   }
   function cancelEditSite() {
     setEditingSiteId(null);
-    setSiteForm({ name: "", enabledTabs: [...ALL_TABS], logoFile: null, weatherCity: "", weatherLat: "", weatherLon: "" });
+    setSiteForm({ name: "", enabledTabs: [...ALL_TABS], logoFile: null, weatherCity: "", weatherLat: "", weatherLon: "", weatherStationId: "" });
     setSiteFeedback(null);
   }
 
@@ -21687,6 +21691,7 @@ function UsersTab({ data, updateData, allTabConfig, isSuperadmin, syncSharedData
     const weatherCity = siteForm.weatherCity.trim() || undefined;
     const weatherLat = siteForm.weatherLat.trim() ? Number(siteForm.weatherLat) : undefined;
     const weatherLon = siteForm.weatherLon.trim() ? Number(siteForm.weatherLon) : undefined;
+    const weatherStationId = siteForm.weatherStationId.trim() || undefined;
 
     if (editingSiteId === null) {
       const newSite: Site = {
@@ -21698,6 +21703,7 @@ function UsersTab({ data, updateData, allTabConfig, isSuperadmin, syncSharedData
         ...(weatherCity !== undefined ? { weatherCity } : {}),
         ...(weatherLat !== undefined ? { weatherLat } : {}),
         ...(weatherLon !== undefined ? { weatherLon } : {}),
+        ...(weatherStationId !== undefined ? { weatherStationId } : {}),
       };
       const { error: insertError } = await supabase.from("app_data").insert({ id: newSite.id, data: omitSharedKeys(initialData), updated_at: new Date().toISOString() });
       if (insertError) {
@@ -21713,14 +21719,14 @@ function UsersTab({ data, updateData, allTabConfig, isSuperadmin, syncSharedData
         return;
       }
       setSiteBusy(false);
-      setSiteForm({ name: "", enabledTabs: [...ALL_TABS], logoFile: null, weatherCity: "", weatherLat: "", weatherLon: "" });
+      setSiteForm({ name: "", enabledTabs: [...ALL_TABS], logoFile: null, weatherCity: "", weatherLat: "", weatherLon: "", weatherStationId: "" });
       setSiteFeedback({ type: "success", text: `Stedet "${newSite.name}" er opprettet.` });
     } else {
       const name = siteForm.name.trim();
       const enabledTabs = siteForm.enabledTabs;
       try {
         await updateSitesList((freshSites) => freshSites.map((s) => s.id === editingSiteId
-          ? { ...s, name, enabledTabs, weatherCity, weatherLat, weatherLon, ...(logoPath ? { logoUrl: logoPath } : {}) }
+          ? { ...s, name, enabledTabs, weatherCity, weatherLat, weatherLon, weatherStationId, ...(logoPath ? { logoUrl: logoPath } : {}) }
           : s));
       } catch (e: any) {
         setSiteBusy(false);
@@ -21729,7 +21735,7 @@ function UsersTab({ data, updateData, allTabConfig, isSuperadmin, syncSharedData
       }
       setSiteBusy(false);
       setEditingSiteId(null);
-      setSiteForm({ name: "", enabledTabs: [...ALL_TABS], logoFile: null, weatherCity: "", weatherLat: "", weatherLon: "" });
+      setSiteForm({ name: "", enabledTabs: [...ALL_TABS], logoFile: null, weatherCity: "", weatherLat: "", weatherLon: "", weatherStationId: "" });
       setSiteFeedback({ type: "success", text: `Stedet "${name}" er oppdatert.` });
     }
   }
@@ -22138,6 +22144,9 @@ function UsersTab({ data, updateData, allTabConfig, isSuperadmin, syncSharedData
           </label>
           <label>Lengdegrad (lon)
             <input type="number" step="any" value={siteForm.weatherLon} onChange={(e) => setSiteForm({ ...siteForm, weatherLon: e.target.value })} placeholder="F.eks. 14.40" />
+          </label>
+          <label>Værstasjon-ID (Frost, valgfritt - for historisk vær)
+            <input value={siteForm.weatherStationId} onChange={(e) => setSiteForm({ ...siteForm, weatherStationId: e.target.value })} placeholder="F.eks. SN82290" />
           </label>
         </div>
         <p style={{ fontWeight: 700, marginBottom: 6 }}>Faner dette stedet skal ha tilgang til</p>
