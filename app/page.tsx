@@ -763,6 +763,34 @@ type ReportArticleMapping = {
   itemType: "product" | "material";
 };
 
+// Vareregistrering (Varelager-fanen): ETT skjema for BÅDE varemottak (innkjøp) og egen produksjon av
+// råvarer/egenproduserte varer (f.eks. dressing) - valgt av brukeren via transactionType, ikke to
+// separate registreringer. Brukes i fase 2 som grunnlag for "estimert varelager".
+type InventoryTransaction = {
+  id: string;
+  date: string; // YYYY-MM-DD
+  transactionType: "mottak" | "produksjon";
+  itemType: "material" | "product"; // "product" = egenprodusert produkt (Kjøkken/Bakeri, egenprodusert)
+  itemId: string;
+  packages: number; // råvare: antall pakker/sekker/kolli. egenprodusert produkt: antall esker
+  loose: number; // løs mengde i råvarens enhet, eller løse stk for egenprodusert produkt
+  pricePerPackage?: number; // kun relevant ved varemottak, valgfritt
+  createdAt: string;
+};
+
+// Registrert svinn - løpende logg gjennom måneden (dato + årsak), for BÅDE råvarer og produkter (ikke
+// begrenset til egenproduserte kategorier, siden svinn på et hvilket som helst produkt kan være aktuelt).
+// Erstatter det gamle per-linje svinnfeltet i varetellingen (se DEL 12/13/14/15).
+type WasteLogEntry = {
+  id: string;
+  date: string; // YYYY-MM-DD
+  itemType: "material" | "product";
+  itemId: string;
+  quantity: number; // i råvarens enhet, eller stk for produkt
+  reason: string;
+  createdAt: string;
+};
+
 type ReportSnapshot = {
   id: string;
   month: string; // "YYYY-MM"
@@ -854,6 +882,8 @@ type AppData = {
   productionTemplates: ProductionTemplate[];
   reportArticleMappings: ReportArticleMapping[];
   reportSnapshots: ReportSnapshot[];
+  inventoryTransactions: InventoryTransaction[];
+  wasteLog: WasteLogEntry[];
   barTemplates: BarTemplate[];
   barTallyEntries: BarTallyEntry[];
   customerDirectory: CustomerDirectoryEntry[];
@@ -1206,6 +1236,8 @@ rental: { customer: "", venue: "Kaféen", venuePrice: 11000, waiters: 1, waiterH
   productionTemplates: [],
   reportArticleMappings: [],
   reportSnapshots: [],
+  inventoryTransactions: [],
+  wasteLog: [],
   barTemplates: [],
   barTallyEntries: [],
   customerDirectory: [],
@@ -1330,6 +1362,12 @@ reportArticleMappings:
 
 reportSnapshots:
   (raw as any).reportSnapshots || [],
+
+inventoryTransactions:
+  (raw as any).inventoryTransactions || [],
+
+wasteLog:
+  (raw as any).wasteLog || [],
 
 barTemplates:
   (raw as any).barTemplates || [],
@@ -1674,7 +1712,7 @@ export default function Page() {
   { key: "products",   label: "Produkter",          icon: "🍽", color: "#db2777" },
   { key: "orders",     label: "Ordre",              icon: "📋", color: "#2563eb" },
   { key: "production", label: "Produksjon",         icon: "🥖", color: "#ea580c" },
-  { key: "inventory",  label: "Varetelling",        icon: "📦", color: "#0891b2" },
+  { key: "inventory",  label: "Varelager",          icon: "📦", color: "#0891b2" },
   { key: "rental",     label: "Leie av lokale",     icon: "🏠", color: "#ca8a04" },
   { key: "eventkalkyle", label: "Eventkalkyle",     icon: "🎪", color: "#c026d3" },
   { key: "priceAgreements", label: "Avtalepriser",  icon: "🏷️", color: "#65a30d" },
@@ -12300,6 +12338,282 @@ function InventoryVarianceReport({ data, month, productUnitCost }: {
   );
 }
 
+// Vareregistrering: "Legg til beholdning" (varemottak/produksjon i ett skjema) + "Registrert svinn"
+// (løpende logg m/årsak). Egen, selvstendig komponent (samme mønster som ProfitabilityReport/
+// InventoryVarianceReport) - skriver direkte til data via updateData (helhetlig upsert), akkurat som
+// saveProductWasteFromReport/reportArticleMappings allerede gjør andre steder i InventoryTab/ReportsTab,
+// siden dette er sjeldne, bevisste brukerhandlinger og ikke fortløpende telling.
+function VareregistreringPanel({ data, updateData, productUnitCost, readOnly }: {
+  data: AppData;
+  updateData: (p: Partial<AppData>) => void;
+  productUnitCost: (p: Product) => number;
+  readOnly: boolean;
+}) {
+  const egenprodusertCategories = ["Kjøkken, egenprodusert", "Bakeri, egenprodusert"];
+
+  // --- Legg til beholdning ---
+  const [regType, setRegType] = useState<"mottak" | "produksjon">("mottak");
+  const [regSearch, setRegSearch] = useState("");
+  const [regSelected, setRegSelected] = useState<{ itemType: "material" | "product"; itemId: string; name: string; unitLabel: string } | null>(null);
+  const [regPackages, setRegPackages] = useState("");
+  const [regLoose, setRegLoose] = useState("");
+  const [regPrice, setRegPrice] = useState("");
+  const [regDate, setRegDate] = useState(today());
+
+  const regCandidates = regSearch
+    ? [
+        ...data.materials
+          .filter((m) => m.name.toLowerCase().includes(regSearch.toLowerCase()))
+          .map((m) => ({ itemType: "material" as const, itemId: m.id, name: m.name, unitLabel: m.unit })),
+        ...data.products
+          .filter((p) => egenprodusertCategories.includes(p.category))
+          .filter((p) => p.name.toLowerCase().includes(regSearch.toLowerCase()))
+          .map((p) => ({ itemType: "product" as const, itemId: p.id, name: p.name, unitLabel: "stk" })),
+      ].slice(0, 30)
+    : [];
+
+  function addInventoryTransaction() {
+    if (!regSelected) return;
+    const packages = Number(regPackages) || 0;
+    const loose = Number(regLoose) || 0;
+    if (packages <= 0 && loose <= 0) return;
+    const entry: InventoryTransaction = {
+      id: `invtx-${Date.now()}`,
+      date: regDate,
+      transactionType: regType,
+      itemType: regSelected.itemType,
+      itemId: regSelected.itemId,
+      packages,
+      loose,
+      pricePerPackage: regType === "mottak" ? (Number(regPrice) || undefined) : undefined,
+      createdAt: new Date().toISOString(),
+    };
+    updateData({ inventoryTransactions: [...(data.inventoryTransactions || []), entry] });
+    setRegSelected(null);
+    setRegSearch("");
+    setRegPackages("");
+    setRegLoose("");
+    setRegPrice("");
+  }
+
+  function deleteInventoryTransaction(id: string) {
+    updateData({ inventoryTransactions: (data.inventoryTransactions || []).filter((t) => t.id !== id) });
+  }
+
+  const recentTransactions = [...(data.inventoryTransactions || [])]
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+    .slice(0, 25);
+
+  function transactionItemName(t: InventoryTransaction): string {
+    if (t.itemType === "material") return data.materials.find((m) => m.id === t.itemId)?.name || "(slettet råvare)";
+    return data.products.find((p) => p.id === t.itemId)?.name || "(slettet produkt)";
+  }
+  function transactionUnitLabel(t: InventoryTransaction): string {
+    if (t.itemType === "material") return data.materials.find((m) => m.id === t.itemId)?.unit || "";
+    return "stk";
+  }
+
+  // --- Registrert svinn ---
+  const wasteReasonOptions = ["Glemt/kastet", "Feilbaking", "Holdbarhet utløpt", "Skadet", "Prøvesmaking", "Annet"];
+  const [wasteSearch, setWasteSearch] = useState("");
+  const [wasteSelected, setWasteSelected] = useState<{ itemType: "material" | "product"; itemId: string; name: string; unitLabel: string } | null>(null);
+  const [wasteQuantity, setWasteQuantity] = useState("");
+  const [wasteReason, setWasteReason] = useState("");
+  const [wasteReasonCustom, setWasteReasonCustom] = useState("");
+  const [wasteDate, setWasteDate] = useState(today());
+
+  const wasteCandidates = wasteSearch
+    ? [
+        ...data.materials
+          .filter((m) => m.name.toLowerCase().includes(wasteSearch.toLowerCase()))
+          .map((m) => ({ itemType: "material" as const, itemId: m.id, name: m.name, unitLabel: m.unit })),
+        ...data.products
+          .filter((p) => p.name.toLowerCase().includes(wasteSearch.toLowerCase()))
+          .map((p) => ({ itemType: "product" as const, itemId: p.id, name: p.name, unitLabel: "stk" })),
+      ].slice(0, 30)
+    : [];
+
+  function addWasteLogEntry() {
+    if (!wasteSelected) return;
+    const quantity = Number(wasteQuantity) || 0;
+    if (quantity <= 0) return;
+    const reason = wasteReason === "Annet" ? (wasteReasonCustom.trim() || "Annet") : wasteReason;
+    if (!reason) return;
+    const entry: WasteLogEntry = {
+      id: `waste-log-${Date.now()}`,
+      date: wasteDate,
+      itemType: wasteSelected.itemType,
+      itemId: wasteSelected.itemId,
+      quantity,
+      reason,
+      createdAt: new Date().toISOString(),
+    };
+    updateData({ wasteLog: [...(data.wasteLog || []), entry] });
+    setWasteSelected(null);
+    setWasteSearch("");
+    setWasteQuantity("");
+    setWasteReason("");
+    setWasteReasonCustom("");
+  }
+
+  function deleteWasteLogEntry(id: string) {
+    updateData({ wasteLog: (data.wasteLog || []).filter((w) => w.id !== id) });
+  }
+
+  const recentWasteEntries = [...(data.wasteLog || [])]
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+    .slice(0, 25);
+
+  function wasteItemName(w: WasteLogEntry): string {
+    if (w.itemType === "material") return data.materials.find((m) => m.id === w.itemId)?.name || "(slettet råvare)";
+    return data.products.find((p) => p.id === w.itemId)?.name || "(slettet produkt)";
+  }
+  function wasteUnitLabel(w: WasteLogEntry): string {
+    if (w.itemType === "material") return data.materials.find((m) => m.id === w.itemId)?.unit || "";
+    return "stk";
+  }
+
+  return (
+    <>
+      <div className="soft-box" style={{ marginBottom: 16 }}>
+        <h3 style={{ marginTop: 0 }}>Legg til beholdning</h3>
+        <p className="muted" style={{ fontSize: 13 }}>Registrer varemottak (innkjøp) eller egen produksjon av råvarer/egenproduserte varer.</p>
+
+        <div className="chips" style={{ marginBottom: 12 }}>
+          <button className={regType === "mottak" ? "btn active" : "btn"} disabled={readOnly} onClick={() => setRegType("mottak")}>Varemottak</button>
+          <button className={regType === "produksjon" ? "btn active" : "btn"} disabled={readOnly} onClick={() => setRegType("produksjon")}>Produksjon</button>
+        </div>
+
+        <div className="form-grid three">
+          <label>Dato
+            <input type="date" disabled={readOnly} value={regDate} onChange={(e) => setRegDate(e.target.value)} />
+          </label>
+          <label style={{ gridColumn: "span 2" }}>Vare (råvare eller egenprodusert produkt)
+            <div className="search-picker">
+              <input
+                value={regSearch || (regSelected?.name ?? "")}
+                disabled={readOnly}
+                onChange={(e) => { setRegSearch(e.target.value); setRegSelected(null); }}
+                onFocus={() => setRegSearch(regSearch || "")}
+                placeholder="Søk vare..."
+              />
+              {regSearch !== "" && !regSelected && (
+                <div className="search-dropdown inline">
+                  {regCandidates.map((c) => (
+                    <button key={`${c.itemType}-${c.itemId}`} type="button" className="search-result" onClick={() => { setRegSelected(c); setRegSearch(""); }}>
+                      <b>{c.name}</b> <span style={{ color: "#94a3b8", fontSize: 11 }}>{c.itemType === "material" ? "råvare" : "egenprodusert"}</span>
+                    </button>
+                  ))}
+                  {regCandidates.length === 0 && <div className="search-result" style={{ color: "#94a3b8", cursor: "default" }}>Ingen treff</div>}
+                </div>
+              )}
+            </div>
+          </label>
+        </div>
+
+        <div className="form-grid three" style={{ marginTop: 12 }}>
+          <label>{regSelected?.itemType === "product" ? "Esker" : "Pakker/sekker"}
+            <input type="number" disabled={readOnly} value={regPackages} onChange={(e) => setRegPackages(e.target.value)} placeholder="0" />
+          </label>
+          <label>Løs mengde {regSelected ? `(${regSelected.unitLabel})` : ""}
+            <input type="number" disabled={readOnly} value={regLoose} onChange={(e) => setRegLoose(e.target.value)} placeholder="0" />
+          </label>
+          {regType === "mottak" && (
+            <label>Pris pr. {regSelected?.itemType === "product" ? "eske" : "pakke/sekk"} (kr, valgfritt)
+              <input type="number" disabled={readOnly} value={regPrice} onChange={(e) => setRegPrice(e.target.value)} placeholder="0" />
+            </label>
+          )}
+        </div>
+
+        <button className="btn active" style={{ marginTop: 12 }} disabled={readOnly || !regSelected} onClick={addInventoryTransaction}>Legg til</button>
+
+        {recentTransactions.length > 0 && (
+          <table style={{ marginTop: 16 }}>
+            <thead><tr><th>Dato</th><th>Type</th><th>Vare</th><th>Mengde</th><th></th></tr></thead>
+            <tbody>
+              {recentTransactions.map((t) => (
+                <tr key={t.id}>
+                  <td>{t.date}</td>
+                  <td>{t.transactionType === "mottak" ? "Varemottak" : "Produksjon"}</td>
+                  <td>{transactionItemName(t)}</td>
+                  <td>{t.packages > 0 ? `${t.packages} ${t.itemType === "product" ? "esker" : "pakker"}` : ""}{t.packages > 0 && t.loose > 0 ? " + " : ""}{t.loose > 0 ? `${t.loose} ${transactionUnitLabel(t)}` : ""}</td>
+                  <td><button className="link danger" disabled={readOnly} onClick={() => deleteInventoryTransaction(t.id)}>Slett</button></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+
+      <div className="soft-box">
+        <h3 style={{ marginTop: 0 }}>Registrert svinn</h3>
+        <p className="muted" style={{ fontSize: 13 }}>Registrer svinn løpende gjennom måneden, for råvarer eller produkter, med årsak.</p>
+
+        <div className="form-grid three">
+          <label>Dato
+            <input type="date" disabled={readOnly} value={wasteDate} onChange={(e) => setWasteDate(e.target.value)} />
+          </label>
+          <label style={{ gridColumn: "span 2" }}>Vare (råvare eller produkt)
+            <div className="search-picker">
+              <input
+                value={wasteSearch || (wasteSelected?.name ?? "")}
+                disabled={readOnly}
+                onChange={(e) => { setWasteSearch(e.target.value); setWasteSelected(null); }}
+                onFocus={() => setWasteSearch(wasteSearch || "")}
+                placeholder="Søk vare..."
+              />
+              {wasteSearch !== "" && !wasteSelected && (
+                <div className="search-dropdown inline">
+                  {wasteCandidates.map((c) => (
+                    <button key={`${c.itemType}-${c.itemId}`} type="button" className="search-result" onClick={() => { setWasteSelected(c); setWasteSearch(""); }}>
+                      <b>{c.name}</b> <span style={{ color: "#94a3b8", fontSize: 11 }}>{c.itemType === "material" ? "råvare" : "produkt"}</span>
+                    </button>
+                  ))}
+                  {wasteCandidates.length === 0 && <div className="search-result" style={{ color: "#94a3b8", cursor: "default" }}>Ingen treff</div>}
+                </div>
+              )}
+            </div>
+          </label>
+        </div>
+
+        <div className="form-grid three" style={{ marginTop: 12 }}>
+          <label>Mengde {wasteSelected ? `(${wasteSelected.unitLabel})` : ""}
+            <input type="number" disabled={readOnly} value={wasteQuantity} onChange={(e) => setWasteQuantity(e.target.value)} placeholder="0" />
+          </label>
+        </div>
+
+        <div className="chips" style={{ marginTop: 12 }}>
+          {wasteReasonOptions.map((r) => (
+            <button key={r} type="button" className={wasteReason === r ? "btn active" : "btn"} disabled={readOnly} onClick={() => setWasteReason(r)}>{r}</button>
+          ))}
+        </div>
+        {wasteReason === "Annet" && (
+          <input style={{ marginTop: 8 }} disabled={readOnly} value={wasteReasonCustom} onChange={(e) => setWasteReasonCustom(e.target.value)} placeholder="Beskriv årsak..." />
+        )}
+
+        <button className="btn active" style={{ marginTop: 12 }} disabled={readOnly || !wasteSelected || !wasteReason} onClick={addWasteLogEntry}>Registrer svinn</button>
+
+        {recentWasteEntries.length > 0 && (
+          <table style={{ marginTop: 16 }}>
+            <thead><tr><th>Dato</th><th>Vare</th><th>Mengde</th><th>Årsak</th><th></th></tr></thead>
+            <tbody>
+              {recentWasteEntries.map((w) => (
+                <tr key={w.id}>
+                  <td>{w.date}</td>
+                  <td>{wasteItemName(w)}</td>
+                  <td>{w.quantity} {wasteUnitLabel(w)}</td>
+                  <td>{w.reason}</td>
+                  <td><button className="link danger" disabled={readOnly} onClick={() => deleteWasteLogEntry(w.id)}>Slett</button></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </>
+  );
+}
+
 function InventoryTab({ data, updateData, productUnitCost, updateInventoryRpc, readOnly, siteName }: { data: AppData; updateData: (p: Partial<AppData>) => void; productUnitCost: (p: Product) => number; updateInventoryRpc: (month: string, patch: { itemsPatch?: Record<string, any>; wastePatch?: Record<string, number>; kassasvinn?: number; cashCounts?: { inHouse?: number; deliveredLoomis?: number; bagsNotDelivered?: number }; locked?: boolean; pricesFrozen?: boolean; profitability?: any }) => void; readOnly: boolean; siteName?: string }) {
   const currentYm = new Date().toISOString().slice(0, 7);
   const [inventoryMonth, setInventoryMonth] = useState(currentYm);
@@ -12321,6 +12635,7 @@ function InventoryTab({ data, updateData, productUnitCost, updateInventoryRpc, r
   // tidligere nøkkel med articleName ville kun den første av dem fungert).
   const [wasteReportUnmatchedSelections, setWasteReportUnmatchedSelections] = useState<Record<string, string>>({});
   const [wasteReportSearch, setWasteReportSearch] = useState<Record<string, string>>({});
+  const [invPanel, setInvPanel] = useState<"vareregistrering" | "varetelling">("vareregistrering");
 
   React.useEffect(() => {
     const channel = supabase.channel("inventory-presence")
@@ -12547,7 +12862,12 @@ function InventoryTab({ data, updateData, productUnitCost, updateInventoryRpc, r
     "Diverse mat": "#f8fafc",
   };
 
-  function getMaterialWaste(materialId: string): number { return (counts[materialId] as any)?.waste || 0; }
+  function wasteLogQuantityForItem(itemType: "material" | "product", itemId: string): number {
+    return (data.wasteLog || [])
+      .filter((w) => w.itemType === itemType && w.itemId === itemId && w.date.slice(0, 7) === inventoryMonth)
+      .reduce((sum, w) => sum + Number(w.quantity || 0), 0);
+  }
+  function getMaterialWaste(materialId: string): number { return ((counts[materialId] as any)?.waste || 0) + wasteLogQuantityForItem("material", materialId); }
   function updateMaterialWaste(materialId: string, wasteAmount: number) {
     const material = data.materials.find((m) => m.id === materialId);
     const existing = (counts[materialId] as any) || {};
@@ -12556,7 +12876,7 @@ function InventoryTab({ data, updateData, productUnitCost, updateInventoryRpc, r
     const pricePerUnit = pricesAreFrozen ? existing.pricePerUnit : (material?.pricePerUnit || existing.pricePerUnit || 0);
     updateInventoryRpc(inventoryMonth, { itemsPatch: { [materialId]: { ...existing, packagePrice, pricePerUnit, waste: wasteAmount, countedAt: new Date().toISOString() } } });
   }
-  function getProductWaste(productId: string): number { return (counts[`product_${productId}`] as any)?.waste || 0; }
+  function getProductWaste(productId: string): number { return ((counts[`product_${productId}`] as any)?.waste || 0) + wasteLogQuantityForItem("product", productId); }
   function updateProductWaste(product: Product, wasteAmount: number) {
     const key = `product_${product.id}`;
     const existing = (counts[key] as any) || {};
@@ -13027,15 +13347,8 @@ function InventoryTab({ data, updateData, productUnitCost, updateInventoryRpc, r
               );
             })}
             <div style={{ marginTop: 14 }}>
-              <div style={{ fontWeight: 700, fontSize: 13, color: "#92400e", marginBottom: 8, padding: "4px 10px", background: "#fffbeb", borderRadius: 8, display: "inline-block" }}>⚠️ Svinn</div>
-              <input
-                type="number" inputMode="decimal" disabled={isLocked || readOnly}
-                value={localWaste}
-                onChange={(e) => setLocalWaste(e.target.value)}
-                onBlur={(e) => updateMaterialWaste(m.id, Number(e.target.value) || 0)}
-                placeholder="0"
-                style={{ fontSize: 18, padding: "10px 12px", borderRadius: 10, border: "1px solid #f59e0b", width: "100%", background: isLocked ? "#f8fafc" : "#fffbeb" }}
-              />
+              <div style={{ fontWeight: 700, fontSize: 13, color: "#92400e", marginBottom: 8, padding: "4px 10px", background: "#fffbeb", borderRadius: 8, display: "inline-block" }}>⚠️ Svinn: {getMaterialWaste(m.id)} {m.unit}</div>
+              <p style={{ fontSize: 12, color: "#92400e", margin: 0 }}>Registreres nå under Vareregistrering.</p>
             </div>
             <div style={{ marginTop: 12, textAlign: "right", fontSize: 14, fontWeight: 700 }}>Verdi: {currency(value)}</div>
           </div>
@@ -13127,15 +13440,8 @@ function InventoryTab({ data, updateData, productUnitCost, updateInventoryRpc, r
               );
             })}
             <div style={{ marginTop: 14 }}>
-              <div style={{ fontWeight: 700, fontSize: 13, color: "#92400e", marginBottom: 8, padding: "4px 10px", background: "#fffbeb", borderRadius: 8, display: "inline-block" }}>⚠️ Svinn stk</div>
-              <input
-                type="number" inputMode="decimal" disabled={isLocked || readOnly}
-                value={localWaste}
-                onChange={(e) => setLocalWaste(e.target.value)}
-                onBlur={(e) => updateProductWaste(p, Number(e.target.value) || 0)}
-                placeholder="0"
-                style={{ fontSize: 18, padding: "10px 12px", borderRadius: 10, border: "1px solid #f59e0b", width: "100%", background: isLocked ? "#f8fafc" : "#fffbeb" }}
-              />
+              <div style={{ fontWeight: 700, fontSize: 13, color: "#92400e", marginBottom: 8, padding: "4px 10px", background: "#fffbeb", borderRadius: 8, display: "inline-block" }}>⚠️ Svinn: {getProductWaste(p.id)} stk</div>
+              <p style={{ fontSize: 12, color: "#92400e", margin: 0 }}>Registreres nå under Vareregistrering.</p>
             </div>
             <div style={{ marginTop: 12, textAlign: "right", fontSize: 14, fontWeight: 700 }}>Verdi: {currency(value)}</div>
           </div>
@@ -13147,6 +13453,18 @@ function InventoryTab({ data, updateData, productUnitCost, updateInventoryRpc, r
   return (
     <section className="card">
       {readOnly && <div className="warning">🔒 Du har kun visningstilgang til denne fanen — endringer kan ikke lagres.</div>}
+
+      <div className="chips" style={{ marginBottom: 12 }}>
+        <button className={invPanel === "vareregistrering" ? "btn active" : "btn"} onClick={() => setInvPanel("vareregistrering")}>Vareregistrering</button>
+        <button className={invPanel === "varetelling" ? "btn active" : "btn"} onClick={() => setInvPanel("varetelling")}>Varetelling</button>
+      </div>
+
+      {invPanel === "vareregistrering" && (
+        <VareregistreringPanel data={data} updateData={updateData} productUnitCost={productUnitCost} readOnly={readOnly} />
+      )}
+
+      {invPanel === "varetelling" && (
+      <>
       <div style={{ display: "flex", justifyContent: "flex-end", alignItems: "center", marginBottom: 8 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: isRealtimeConnected ? "#166534" : "#991b1b" }}>
           <div style={{ width: 8, height: 8, borderRadius: "50%", background: isRealtimeConnected ? "#16a34a" : "#dc2626" }} />
@@ -13547,7 +13865,7 @@ function InventoryTab({ data, updateData, productUnitCost, updateInventoryRpc, r
                       <tr key={p.id}>
                         <td><b>{p.name}</b><br /><small style={{ color: "#64748b" }}>{p.productNumber || "-"}</small></td>
                         <td>{currency(unitCost)}</td><td>{Number(p.unitsPerCase || 1)} stk</td>
-{locations.map((loc) => { const lc = getProductCount(p.id, loc); return (<><td key={`${p.id}-${loc}-e`} style={{ borderLeft: "2px solid #cbd5e1" }}><input type="number" disabled={isLocked || readOnly} defaultValue={lc.cases || ""} key={`${p.id}-${loc}-e-${lc.cases}`} onBlur={(e) => updateProductCount(p, loc, Number(e.target.value) || 0, lc.loose)} style={showAllLocations ? { width: 60, minWidth: 0, textAlign: "center" } : { minWidth: 70, textAlign: "center" }} /></td><td key={`${p.id}-${loc}-l`}><input type="number" disabled={isLocked || readOnly} defaultValue={lc.loose || ""} key={`${p.id}-${loc}-l-${lc.loose}`} onBlur={(e) => updateProductCount(p, loc, lc.cases, Number(e.target.value) || 0)} style={showAllLocations ? { width: 60, minWidth: 0, textAlign: "center" } : { minWidth: 70, textAlign: "center" }} /></td></>); })}<td style={{ borderLeft: "2px solid #f59e0b", background: "#fffbeb" }}><input type="number" disabled={isLocked || readOnly} defaultValue={wasteAmt || ""} key={`${p.id}-waste-${wasteAmt}`} onBlur={(e) => updateProductWaste(p, Number(e.target.value) || 0)} style={showAllLocations ? { width: 60, minWidth: 0, textAlign: "center" } : { minWidth: 70, textAlign: "center" }} /></td>                        <td style={{ borderLeft: "2px solid #94a3b8", background: "#f1f5f9", textAlign: "center", color: "#64748b" }}>{prevTotal || "-"}</td>
+{locations.map((loc) => { const lc = getProductCount(p.id, loc); return (<><td key={`${p.id}-${loc}-e`} style={{ borderLeft: "2px solid #cbd5e1" }}><input type="number" disabled={isLocked || readOnly} defaultValue={lc.cases || ""} key={`${p.id}-${loc}-e-${lc.cases}`} onBlur={(e) => updateProductCount(p, loc, Number(e.target.value) || 0, lc.loose)} style={showAllLocations ? { width: 60, minWidth: 0, textAlign: "center" } : { minWidth: 70, textAlign: "center" }} /></td><td key={`${p.id}-${loc}-l`}><input type="number" disabled={isLocked || readOnly} defaultValue={lc.loose || ""} key={`${p.id}-${loc}-l-${lc.loose}`} onBlur={(e) => updateProductCount(p, loc, lc.cases, Number(e.target.value) || 0)} style={showAllLocations ? { width: 60, minWidth: 0, textAlign: "center" } : { minWidth: 70, textAlign: "center" }} /></td></>); })}<td style={{ borderLeft: "2px solid #f59e0b", background: "#fffbeb", textAlign: "center" }}>{wasteAmt || "-"}</td>                        <td style={{ borderLeft: "2px solid #94a3b8", background: "#f1f5f9", textAlign: "center", color: "#64748b" }}>{prevTotal || "-"}</td>
                         <td><b>{currency(value)}</b></td>
                       </tr>
                     ); })}
@@ -13576,7 +13894,7 @@ function InventoryTab({ data, updateData, productUnitCost, updateInventoryRpc, r
                       <tr key={m.id}>
 <td><b>{m.name}</b></td><td>{currency(m.packagePrice)}</td><td>{m.packageSize} {m.unit}</td>
                         {locations.map((loc) => { const lc = getLocationCount(m.id, loc); return (<><td key={`${m.id}-${loc}-p`} style={{ borderLeft: "2px solid #cbd5e1" }}><input type="number" disabled={isLocked || readOnly} defaultValue={lc.packages || ""} key={`${m.id}-${loc}-p-${lc.packages}`} onBlur={(e) => updateLocationCount(m.id, loc, Number(e.target.value) || 0, lc.loose)} style={showAllLocations ? { width: 60, minWidth: 0, textAlign: "center" } : { minWidth: 70, textAlign: "center" }} /></td><td key={`${m.id}-${loc}-l`}><input type="number" disabled={isLocked || readOnly} defaultValue={lc.loose || ""} key={`${m.id}-${loc}-l-${lc.loose}`} onBlur={(e) => updateLocationCount(m.id, loc, lc.packages, Number(e.target.value) || 0)} style={showAllLocations ? { width: 60, minWidth: 0, textAlign: "center" } : { minWidth: 70, textAlign: "center" }} /></td></>); })}
-<td style={{ borderLeft: "2px solid #f59e0b", background: "#fffbeb" }}><input type="number" disabled={isLocked || readOnly} defaultValue={wasteAmt || ""} key={`${m.id}-waste-${wasteAmt}`} onBlur={(e) => updateMaterialWaste(m.id, Number(e.target.value) || 0)} style={showAllLocations ? { width: 60, minWidth: 0, textAlign: "center" } : { minWidth: 70, textAlign: "center" }} /></td>                        <td style={{ borderLeft: "2px solid #94a3b8", background: "#f1f5f9", textAlign: "center", color: "#64748b" }}>{prevTotal || "-"}</td>                        <td><b>{currency(value)}</b></td>
+<td style={{ borderLeft: "2px solid #f59e0b", background: "#fffbeb", textAlign: "center" }}>{wasteAmt || "-"}</td>                        <td style={{ borderLeft: "2px solid #94a3b8", background: "#f1f5f9", textAlign: "center", color: "#64748b" }}>{prevTotal || "-"}</td>                        <td><b>{currency(value)}</b></td>
                       </tr>
                     ); })}
                   </tbody>
@@ -13603,6 +13921,8 @@ function InventoryTab({ data, updateData, productUnitCost, updateInventoryRpc, r
           .inventory-desktop-view { display: none; }
         }
       `}</style>
+      </>
+      )}
     </section>
   );
 }
@@ -22527,10 +22847,12 @@ function ReportsTab({ data, updateData, productUnitCost, updateInventoryRpc, rea
   const relevantMonthKeys = monthKeysInRange(periodFrom, periodTo);
 
   function materialWasteQuantityInPeriod(materialId: string): number {
-    return relevantMonthKeys.reduce((sum, mk) => {
-      const item = data.inventoryCounts?.[mk]?.items?.[materialId] as any;
-      return sum + Number(item?.waste || 0);
-    }, 0);
+    // Leser nå fra den løpende "Registrert svinn"-loggen (Varelager -> Vareregistrering) i stedet for
+    // det gamle per-måned waste-feltet, som ikke lenger fylles ut for nye registreringer - filtrert på
+    // faktisk dato i perioden, ikke month-key, siden loggen er dato-basert.
+    return (data.wasteLog || [])
+      .filter((w) => w.itemType === "material" && w.itemId === materialId && w.date >= periodFrom && w.date <= periodTo)
+      .reduce((sum, w) => sum + Number(w.quantity || 0), 0);
   }
 
   const materialDiffRows = Object.keys(theoreticalConsumption)
