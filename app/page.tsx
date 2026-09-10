@@ -2953,7 +2953,7 @@ return (
         {tab === "dashboard"  && <CalendarDashboard data={data} updateData={updateData} setTab={setTab} setOrderToOpen={setOrderToOpen} setProductionDateToOpen={setProductionDateToOpen} setWantsNewOrder={setWantsNewOrder} setWantsOpenStorkjokkenCustomers={setWantsOpenStorkjokkenCustomers} activeSite={activeSite} setRentalOfferToOpen={setRentalOfferToOpen} setEventCalculationToOpen={setEventCalculationToOpen} showSidePanels />}
         {tab === "materials"  && <MaterialsTab data={data} updateData={updateData} updateMaterialsRpc={updateMaterialsRpc} updateListRpc={updateListRpc} readOnly={!canEdit("materials")} setTab={setTab} setPriceAgreementToOpen={setPriceAgreementToOpen} pendingMaterialId={materialToOpen} clearPendingMaterialId={() => setMaterialToOpen(null)} linkMaterialToAgreement={linkMaterialToAgreement} unlinkMaterialFromAgreement={unlinkMaterialFromAgreement} />}
         {tab === "recipes"    && <RecipesTab data={data} updateData={updateData} updateListRpc={updateListRpc} recipeCost={recipeCost} recipeUnitCost={recipeUnitCost} recipeTotalAmount={recipeTotalAmount} recipeAllergens={recipeAllergens} readOnly={!canEdit("recipes")} isDirty={dirtyTabs.has("recipes")} onDirtyChange={onDirtyChangeFor("recipes")} registerSave={registerSave} />}
-        {tab === "products"   && <ProductsTab data={data} updateData={updateData} updateListRpc={updateListRpc} recipeUnitCost={recipeUnitCost} productCost={productCost} productUnitCost={productUnitCost} productAllergens={productAllergens} recommendedPriceIncVat={recommendedPriceIncVat} readOnly={!canEdit("products")} isDirty={dirtyTabs.has("products")} onDirtyChange={onDirtyChangeFor("products")} registerSave={registerSave} />}
+        {tab === "products"   && <ProductsTab data={data} updateData={updateData} updateListRpc={updateListRpc} recipeUnitCost={recipeUnitCost} productCost={productCost} productUnitCost={productUnitCost} productAllergens={productAllergens} recommendedPriceIncVat={recommendedPriceIncVat} readOnly={!canEdit("products")} userEmail={userEmail} isDirty={dirtyTabs.has("products")} onDirtyChange={onDirtyChangeFor("products")} registerSave={registerSave} />}
         {tab === "orders"     && <OrdersTab data={data} updateData={updateData} updateListRpc={updateListRpc} productAllergens={productAllergens} recipeAllergens={recipeAllergens} setTab={setTab} setRentalOfferToOpen={setRentalOfferToOpen} setEventCalculationToOpen={setEventCalculationToOpen} pendingOrderId={orderToOpen} clearPendingOrderId={() => setOrderToOpen(null)} pendingNewOrder={wantsNewOrder} clearPendingNewOrder={() => setWantsNewOrder(false)} readOnly={!canEdit("orders")} userEmail={userEmail} isSuperadmin={isSuperadmin} isDirty={dirtyTabs.has("orders")} onDirtyChange={onDirtyChangeFor("orders")} registerSave={registerSave} printFlags={printFlags} setPrintFlags={setPrintFlags} selectedAllergens={selectedAllergens} orderSubtotalIncVat={orderSubtotalIncVat} orderDiscountAmount={orderDiscountAmount} orderTotalIncVat={orderTotalIncVat} orderAllergenWarnings={orderAllergenWarnings} printOrder={printOrder} />}
         {tab === "production" && <ProductionTab data={data} updateData={updateData} productAllergens={productAllergens} productCost={productCost} pendingDate={productionDateToOpen} clearPendingDate={() => setProductionDateToOpen(null)} pendingOpenStorkjokkenCustomers={wantsOpenStorkjokkenCustomers} clearPendingOpenStorkjokkenCustomers={() => setWantsOpenStorkjokkenCustomers(false)} readOnly={!canEdit("production")} printFlags={printFlags} setPrintFlags={setPrintFlags} printOrder={printOrder} buildOrderPrintHtml={buildOrderPrintHtml} orderPrintStyleTag={orderPrintStyleTag} />}
         {tab === "inventory"  && <InventoryTab data={data} updateData={updateData} productUnitCost={productUnitCost} updateInventoryRpc={updateInventoryRpc} readOnly={!canEdit("inventory")} siteName={activeSite?.name} userEmail={userEmail} />}
@@ -5212,7 +5212,7 @@ function hashCode(str: string) {
   return hash;
 }
 
-function ProductsTab({ data, updateData, updateListRpc, recipeUnitCost, productCost, productUnitCost, productAllergens, recommendedPriceIncVat, readOnly, isDirty, onDirtyChange, registerSave }: { data: AppData; updateData: (p: Partial<AppData>) => void; updateListRpc: (listKey: "products" | "recipes" | "orders", itemsPatch: Record<string, any>) => void; recipeUnitCost: (r: Recipe) => number; productCost: (p: Product) => number; productUnitCost: (p: Product) => number; productAllergens: (p: Product) => string[]; recommendedPriceIncVat: (cost: number, margin: number) => number; readOnly: boolean; isDirty: boolean; onDirtyChange: (dirty: boolean) => void; registerSave: (fn: (() => boolean) | null) => void }) {
+function ProductsTab({ data, updateData, updateListRpc, recipeUnitCost, productCost, productUnitCost, productAllergens, recommendedPriceIncVat, readOnly, userEmail, isDirty, onDirtyChange, registerSave }: { data: AppData; updateData: (p: Partial<AppData>) => void; updateListRpc: (listKey: "products" | "recipes" | "orders", itemsPatch: Record<string, any>) => void; recipeUnitCost: (r: Recipe) => number; productCost: (p: Product) => number; productUnitCost: (p: Product) => number; productAllergens: (p: Product) => string[]; recommendedPriceIncVat: (cost: number, margin: number) => number; readOnly: boolean; userEmail: string; isDirty: boolean; onDirtyChange: (dirty: boolean) => void; registerSave: (fn: (() => boolean) | null) => void }) {
   const [selectedId, setSelectedId] = useState(data.products[0]?.id || "");
   const [mode, setMode] = useState<"view" | "new" | "edit">("view");
 const [form, setForm] = useState({
@@ -5267,6 +5267,9 @@ const [lineSearch, setLineSearch] = useState("");
   const [scheduledDate, setScheduledDate] = useState("");
   const [productPage, setProductPage] = useState(1);
   const [wideProductId, setWideProductId] = useState<string | null>(null);
+  const [scalePrintProductId, setScalePrintProductId] = useState<string | null>(null);
+  const [scalePrintQty, setScalePrintQty] = useState("");
+  const [scalePrintAddToInventory, setScalePrintAddToInventory] = useState(false);
   const [listMode, setListMode] = useState<ProductListKind>("bakst");
   const [showProductListEditor, setShowProductListEditor] = useState(false);
   const [listName, setListName] = useState("Ny produktliste");
@@ -6253,6 +6256,63 @@ th{background:#f3f4f6}
   w.focus();
 }
 
+  const egenprodusertCategories = ["Kjøkken, egenprodusert", "Bakeri, egenprodusert"];
+
+  function printWindow(title: string, body: string) {
+    const w = window.open("", "_blank"); if (!w) return;
+    w.document.write(`<!doctype html><html><head><meta charset="utf-8" /><title>${escapeHtml(title)}</title><style>
+@page{size:A4;margin:12mm}
+body{font-family:Arial,sans-serif;color:#111827;padding:24px;line-height:1.35}
+.print-header{display:flex;justify-content:center;align-items:center;margin-bottom:20px}
+.print-logo{max-width:220px;max-height:90px;object-fit:contain}
+.logo{height:90px;width:auto;object-fit:contain;margin-bottom:8px}
+.page{break-after:page;border:2px solid #111827;border-radius:14px;padding:18px;margin-bottom:18px;break-inside:avoid;page-break-inside:avoid}
+.frontpage{break-after:page;border:2px solid #111827;border-radius:14px;padding:18px;margin-bottom:18px}
+.frontpage table td,.frontpage table th{padding:6px 8px}
+.subpage{border:2px solid #111827;border-radius:14px;padding:18px;margin-bottom:18px;break-inside:avoid;page-break-inside:avoid}
+.page:last-child{break-after:auto}
+.top{border-bottom:2px solid #111827;padding-bottom:12px;margin-bottom:16px;display:flex;justify-content:space-between;gap:12px}
+h1,h2,h3{margin-top:0}
+table{width:100%;border-collapse:collapse;margin-top:10px;font-size:12px}
+th,td{border-bottom:1px solid #e5e7eb;padding:8px;text-align:left;vertical-align:top}
+th{background:#f3f4f6}
+.right{text-align:right}.muted{color:#64748b}
+.total{font-weight:900;background:#f8fafc}
+.recipe-block{margin:12px 0;background:#f8fafc;border-radius:8px;padding:12px}
+.recipe-block h3{margin:0 0 8px;font-size:14px}
+button{padding:10px 14px;border-radius:10px;border:1px solid #111827;background:#111827;color:white;font-weight:800;cursor:pointer;margin-bottom:14px}
+@media print{button{display:none}body{padding:0}}
+</style></head><body><button onclick="window.print()">Skriv ut</button>${body}</body></html>`);
+    w.document.close(); w.focus();
+  }
+
+  function printScaledRecipe(product: Product, quantity: number, addToInventory: boolean) {
+    const body = `<div class="page"><div class="top"><div><h1>${escapeHtml(product.name)}</h1><p class="muted">Skalert til ${num(quantity, 2)} ${escapeHtml(product.yieldUnit)}</p></div><div class="right"><b>${formatDateNo(new Date().toISOString())}</b></div></div>${scaledRecipeHtmlForOrder(data, product, quantity, undefined, true, true)}</div>`;
+    printWindow(`Skalert oppskrift: ${product.name}`, body);
+
+    if (addToInventory && egenprodusertCategories.includes(product.category)) {
+      const perCase = Number(product.unitsPerCase || 0);
+      const packages = perCase > 0 ? Math.floor(quantity / perCase) : 0;
+      const loose = perCase > 0 ? quantity - packages * perCase : quantity;
+      const entry: InventoryTransaction = {
+        id: `invtx-${Date.now()}`,
+        date: new Date().toISOString().slice(0, 10),
+        transactionType: "produksjon",
+        itemType: "product",
+        itemId: product.id,
+        packages,
+        loose,
+        createdAt: new Date().toISOString(),
+        createdBy: userEmail,
+      };
+      updateData({ inventoryTransactions: [...(data.inventoryTransactions || []), entry] });
+    }
+
+    setScalePrintProductId(null);
+    setScalePrintQty("");
+    setScalePrintAddToInventory(false);
+  }
+
   const portionsDivisor = form.type === "pasmuurt" && Number(form.portionsPerWhole) > 0 ? Number(form.portionsPerWhole) : 1;
   const activeCost = activeProduct ? productCost(activeProduct) : 0;
   const activeUnitCost = activeProduct ? productUnitCost(activeProduct) / portionsDivisor : 0;
@@ -6911,6 +6971,9 @@ th{background:#f3f4f6}
 <button className="btn" onClick={() => printProduct(p)}>
   Print
 </button>
+<button className="btn" onClick={() => { setScalePrintProductId(p.id); setScalePrintQty(""); setScalePrintAddToInventory(false); }}>
+  Print skalert oppskrift
+</button>
 <button
   className="btn"
   disabled={readOnly}
@@ -6955,6 +7018,40 @@ th{background:#f3f4f6}
       </>
       )}
     </div>
+
+    {scalePrintProductId && (() => {
+      const scaleProduct = data.products.find((x) => x.id === scalePrintProductId);
+      if (!scaleProduct) return null;
+      return (
+        <div className="card" style={{ marginTop: 12 }}>
+          <div className="between">
+            <h2>Print skalert oppskrift: {scaleProduct.name}</h2>
+            <button className="btn" onClick={() => setScalePrintProductId(null)}>Lukk</button>
+          </div>
+          <div style={{ display: "flex", gap: 12, alignItems: "flex-end", flexWrap: "wrap", marginTop: 8 }}>
+            <label>Antall ({scaleProduct.yieldUnit})
+              <input type="number" step="0.01" min="0" value={scalePrintQty} onChange={(e) => setScalePrintQty(e.target.value)} style={{ width: 120, display: "block" }} />
+            </label>
+            {egenprodusertCategories.includes(scaleProduct.category) && (
+              <label className="check">
+                <input type="checkbox" checked={scalePrintAddToInventory} onChange={(e) => setScalePrintAddToInventory(e.target.checked)} />
+                Legg til i beholdning (produksjon)
+              </label>
+            )}
+            <button
+              className="btn active"
+              onClick={() => {
+                const qty = Number(scalePrintQty);
+                if (!qty || qty <= 0) { alert("Skriv inn et gyldig antall."); return; }
+                printScaledRecipe(scaleProduct, qty, scalePrintAddToInventory);
+              }}
+            >
+              Skriv ut
+            </button>
+          </div>
+        </div>
+      );
+    })()}
 
     {wideProduct && (
       <div className="card wide-product-view">
