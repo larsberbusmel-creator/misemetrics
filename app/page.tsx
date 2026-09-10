@@ -7023,31 +7023,33 @@ button{padding:10px 14px;border-radius:10px;border:1px solid #111827;background:
       const scaleProduct = data.products.find((x) => x.id === scalePrintProductId);
       if (!scaleProduct) return null;
       return (
-        <div className="card" style={{ marginTop: 12 }}>
-          <div className="between">
-            <h2>Print skalert oppskrift: {scaleProduct.name}</h2>
-            <button className="btn" onClick={() => setScalePrintProductId(null)}>Lukk</button>
-          </div>
-          <div style={{ display: "flex", gap: 12, alignItems: "flex-end", flexWrap: "wrap", marginTop: 8 }}>
-            <label>Antall ({scaleProduct.yieldUnit})
-              <input type="number" step="0.01" min="0" value={scalePrintQty} onChange={(e) => setScalePrintQty(e.target.value)} style={{ width: 120, display: "block" }} />
-            </label>
-            {egenprodusertCategories.includes(scaleProduct.category) && (
-              <label className="check">
-                <input type="checkbox" checked={scalePrintAddToInventory} onChange={(e) => setScalePrintAddToInventory(e.target.checked)} />
-                Legg til i beholdning (produksjon)
+        <div style={{ position: "fixed", inset: 0, zIndex: 2000, background: "rgba(15,23,42,0.5)", display: "flex", alignItems: "center", justifyContent: "center", padding: 16 }} onClick={() => setScalePrintProductId(null)}>
+          <div style={{ background: "white", borderRadius: 16, padding: 24, maxWidth: 460, width: "100%", boxShadow: "0 20px 40px rgba(0,0,0,0.25)" }} onClick={(e) => e.stopPropagation()}>
+            <div className="between">
+              <h2>Print skalert oppskrift: {scaleProduct.name}</h2>
+              <button className="btn" onClick={() => setScalePrintProductId(null)}>Lukk</button>
+            </div>
+            <div style={{ display: "flex", gap: 12, alignItems: "flex-end", flexWrap: "wrap", marginTop: 8 }}>
+              <label>Antall ({scaleProduct.yieldUnit})
+                <input type="number" step="0.01" min="0" value={scalePrintQty} onChange={(e) => setScalePrintQty(e.target.value)} style={{ width: 120, display: "block" }} />
               </label>
-            )}
-            <button
-              className="btn active"
-              onClick={() => {
-                const qty = Number(scalePrintQty);
-                if (!qty || qty <= 0) { alert("Skriv inn et gyldig antall."); return; }
-                printScaledRecipe(scaleProduct, qty, scalePrintAddToInventory);
-              }}
-            >
-              Skriv ut
-            </button>
+              {egenprodusertCategories.includes(scaleProduct.category) && (
+                <label className="check">
+                  <input type="checkbox" checked={scalePrintAddToInventory} onChange={(e) => setScalePrintAddToInventory(e.target.checked)} />
+                  Legg til i beholdning (produksjon)
+                </label>
+              )}
+              <button
+                className="btn active"
+                onClick={() => {
+                  const qty = Number(scalePrintQty);
+                  if (!qty || qty <= 0) { alert("Skriv inn et gyldig antall."); return; }
+                  printScaledRecipe(scaleProduct, qty, scalePrintAddToInventory);
+                }}
+              >
+                Skriv ut
+              </button>
+            </div>
           </div>
         </div>
       );
