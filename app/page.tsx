@@ -791,6 +791,21 @@ type WasteLogEntry = {
   createdAt: string;
 };
 
+// Faktisk salg (fase 3) - periodevis registrering (import fra Favn-rapport ELLER manuell
+// inntasting) av solgt/brukt antall pr. råvare/produkt, brukt som forbruksgrunnlag i den nye
+// "Estimert vs. faktisk telling"-avviksrapporten i Rapporter, for varer uten (eller i tillegg
+// til) produksjon/ordre/leie-sporing.
+type ActualSalesEntry = {
+  id: string;
+  periodFrom: string; // YYYY-MM-DD
+  periodTo: string; // YYYY-MM-DD
+  itemType: "material" | "product";
+  itemId: string;
+  quantity: number;
+  source: "import" | "manual";
+  createdAt: string;
+};
+
 type ReportSnapshot = {
   id: string;
   month: string; // "YYYY-MM"
@@ -884,6 +899,7 @@ type AppData = {
   reportSnapshots: ReportSnapshot[];
   inventoryTransactions: InventoryTransaction[];
   wasteLog: WasteLogEntry[];
+  actualSalesLog: ActualSalesEntry[];
   barTemplates: BarTemplate[];
   barTallyEntries: BarTallyEntry[];
   customerDirectory: CustomerDirectoryEntry[];
@@ -1238,6 +1254,7 @@ rental: { customer: "", venue: "Kaféen", venuePrice: 11000, waiters: 1, waiterH
   reportSnapshots: [],
   inventoryTransactions: [],
   wasteLog: [],
+  actualSalesLog: [],
   barTemplates: [],
   barTallyEntries: [],
   customerDirectory: [],
@@ -1368,6 +1385,9 @@ inventoryTransactions:
 
 wasteLog:
   (raw as any).wasteLog || [],
+
+actualSalesLog:
+  (raw as any).actualSalesLog || [],
 
 barTemplates:
   (raw as any).barTemplates || [],
@@ -22710,6 +22730,10 @@ function ReportsTab({ data, updateData, productUnitCost, updateInventoryRpc, rea
   const [crossStatsSourceProduction, setCrossStatsSourceProduction] = useState(true);
   const [crossStatsOrderType, setCrossStatsOrderType] = useState("");
   const [crossStatsCategory, setCrossStatsCategory] = useState("");
+  const [salesConsumptionMode, setSalesConsumptionMode] = useState<"auto" | "always">("auto");
+  const [manualSalesSearch, setManualSalesSearch] = useState("");
+  const [manualSalesSelected, setManualSalesSelected] = useState<{ itemType: "material" | "product"; itemId: string; name: string; unitLabel: string } | null>(null);
+  const [manualSalesQuantity, setManualSalesQuantity] = useState("");
 
   function recommendedPriceAtVat(costExVat: number, marginPercent: number, vatRate: number) {
     const margin = Number(marginPercent || 0) / 100;
@@ -23057,6 +23081,233 @@ function ReportsTab({ data, updateData, productUnitCost, updateInventoryRpc, rea
     .filter((r): r is NonNullable<typeof r> => !!r && (r.theoreticalValue !== 0 || r.actualValue !== 0))
     .sort((a, b) => Math.abs(b.diffValue) - Math.abs(a.diffValue));
 
+  // DEL FASE3: faktisk salg (manuell + fra Favn-import) og ny avviksrapport ("Estimert vs.
+  // faktisk telling"). Egen, lokal logikk - ReportsTab og VareregistreringPanel deler ikke
+  // closures, så directConsumptionPerUnit/transaksjons-/svinnfunksjonene under speiler (men
+  // gjenbruker ikke kode fra) fase 2 sin versjon i VareregistreringPanel.
+  const actualSalesCandidates = manualSalesSearch
+    ? [
+        ...data.materials
+          .filter((m) => m.name.toLowerCase().includes(manualSalesSearch.toLowerCase()))
+          .map((m) => ({ itemType: "material" as const, itemId: m.id, name: m.name, unitLabel: m.unit })),
+        ...data.products
+          .filter((p) => p.name.toLowerCase().includes(manualSalesSearch.toLowerCase()))
+          .map((p) => ({ itemType: "product" as const, itemId: p.id, name: p.name, unitLabel: "stk" })),
+      ].slice(0, 30)
+    : [];
+
+  function addManualSalesEntry() {
+    if (!manualSalesSelected || !periodFrom || !periodTo) return;
+    const quantity = Number(manualSalesQuantity) || 0;
+    if (quantity <= 0) return;
+    const entry: ActualSalesEntry = {
+      id: `actsale-${Date.now()}`,
+      periodFrom,
+      periodTo,
+      itemType: manualSalesSelected.itemType,
+      itemId: manualSalesSelected.itemId,
+      quantity,
+      source: "manual",
+      createdAt: new Date().toISOString(),
+    };
+    updateData({ actualSalesLog: [...(data.actualSalesLog || []), entry] });
+    setManualSalesSelected(null);
+    setManualSalesSearch("");
+    setManualSalesQuantity("");
+  }
+
+  function deleteActualSalesEntry(id: string) {
+    updateData({ actualSalesLog: (data.actualSalesLog || []).filter((e) => e.id !== id) });
+  }
+
+  function actualSalesItemName(e: ActualSalesEntry): string {
+    if (e.itemType === "material") return data.materials.find((m) => m.id === e.itemId)?.name || "(slettet råvare)";
+    return data.products.find((p) => p.id === e.itemId)?.name || "(slettet produkt)";
+  }
+
+  const actualSalesEntriesInPeriod = (data.actualSalesLog || [])
+    .filter((e) => e.periodFrom === periodFrom && e.periodTo === periodTo)
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+
+  function actualSalesQtyForItem(itemType: "material" | "product", itemId: string): number {
+    return actualSalesEntriesInPeriod
+      .filter((e) => e.itemType === itemType && e.itemId === itemId)
+      .reduce((sum, e) => sum + Number(e.quantity || 0), 0);
+  }
+
+  // Lagrer solgt antall pr. matchet produkt/råvare fra DENNE Favn-opplastingen som faktisk
+  // salg for valgt periode - erstatter kun tidligere "import"-lagrede rader for SAMME periode
+  // (manuelle rader og import fra andre perioder røres ikke).
+  function saveImportedActualSales() {
+    if (!periodFrom || !periodTo) return;
+    const withoutImported = (data.actualSalesLog || []).filter(
+      (e) => !(e.periodFrom === periodFrom && e.periodTo === periodTo && e.source === "import")
+    );
+    const imported: ActualSalesEntry[] = productStats.map((r) => {
+      const [itemType, itemId] = r.key.split(":") as ["product" | "material", string];
+      return {
+        id: `actsale-import-${itemType}-${itemId}-${periodFrom}-${periodTo}`,
+        periodFrom,
+        periodTo,
+        itemType,
+        itemId,
+        quantity: r.quantity,
+        source: "import" as const,
+        createdAt: new Date().toISOString(),
+      };
+    });
+    updateData({ actualSalesLog: [...withoutImported, ...imported] });
+  }
+
+  // Produsert/solgt/utleid antall PR. PRODUKT i valgt periode, på tvers av Ordre/Leie/
+  // Produksjon - gjenbruker de allerede eksisterende crossStats*-funksjonene i denne fanen.
+  function trackedProducedQtyInPeriod(): Record<string, number> {
+    const result: Record<string, number> = {};
+    [crossStatsOrderQuantities(periodFrom, periodTo, ""), crossStatsRentalQuantities(periodFrom, periodTo), crossStatsProductionQuantities(periodFrom, periodTo)].forEach((qtyMap) => {
+      Object.entries(qtyMap).forEach(([productId, qty]) => { result[productId] = (result[productId] || 0) + qty; });
+    });
+    return result;
+  }
+
+  // Kombinerer sporet mengde med faktisk salg pr. produkt, avhengig av valgt modus (se
+  // "Faktisk salg brukes"-bryteren i UI). "auto": faktisk salg brukes KUN når produktet har
+  // null sporet aktivitet i perioden. "always": begge legges sammen, uansett.
+  function effectiveProductQtyInPeriod(): Record<string, number> {
+    const tracked = trackedProducedQtyInPeriod();
+    const result: Record<string, number> = { ...tracked };
+    const productIdsWithSales = new Set(actualSalesEntriesInPeriod.filter((e) => e.itemType === "product").map((e) => e.itemId));
+    productIdsWithSales.forEach((productId) => {
+      const salesQty = actualSalesQtyForItem("product", productId);
+      if (salesConsumptionMode === "always") {
+        result[productId] = (result[productId] || 0) + salesQty;
+      } else if (!tracked[productId]) {
+        result[productId] = salesQty;
+      }
+    });
+    return result;
+  }
+
+  // Ett-nivås forbruksnedbryting - samme prinsipp/kode som directConsumptionPerUnit i
+  // VareregistreringPanel (Varelager, fase 2): stopper VED et "product"-linjeitem (det
+  // produktets EGEN beholdning belastes, i stedet for å rekurere inn i dets råvarer).
+  function directConsumptionPerUnitFase3(product: Product): Record<string, { itemType: "material" | "product"; amount: number }> {
+    const raw: Record<string, { itemType: "material" | "product"; amount: number }> = {};
+    function add(itemType: "material" | "product", itemId: string, amount: number) {
+      const existing = raw[itemId];
+      raw[itemId] = { itemType, amount: (existing?.amount || 0) + amount };
+    }
+    function walkRecipe(recipe: Recipe, amountUsed: number, visited: string[]) {
+      if (visited.includes(recipe.id)) return;
+      const totalAmount = recipe.lines.reduce((sum, l) => sum + Number(l.amount || 0), 0) || Number(recipe.yieldAmount || 1) || 1;
+      const scale = totalAmount > 0 ? amountUsed / totalAmount : 0;
+      recipe.lines.forEach((line) => {
+        const waste = Math.min(Number(line.wastePercent || 0), 95) / 100;
+        const baseAmount = Number(line.amount || 0) * scale;
+        const adjustedAmount = waste > 0 ? baseAmount / (1 - waste) : baseAmount;
+        if (line.itemType === "material") add("material", line.itemId, adjustedAmount);
+        else if (line.itemType === "recipe") {
+          const subRecipe = data.recipes.find((r) => r.id === line.itemId);
+          if (subRecipe) walkRecipe(subRecipe, adjustedAmount, [...visited, recipe.id]);
+        }
+      });
+    }
+    product.lines.forEach((line) => {
+      const waste = Math.min(Number(line.wastePercent || 0), 95) / 100;
+      const baseAmount = Number(line.amount || 0);
+      const adjustedAmount = waste > 0 ? baseAmount / (1 - waste) : baseAmount;
+      if (line.itemType === "material") add("material", line.itemId, adjustedAmount);
+      else if (line.itemType === "recipe") {
+        const recipe = data.recipes.find((r) => r.id === line.itemId);
+        if (recipe) walkRecipe(recipe, adjustedAmount, []);
+      } else if (line.itemType === "product") {
+        add("product", line.itemId, adjustedAmount);
+      }
+    });
+    const totalWeight = Number(product.recipeYieldAmount || 1) || 1;
+    const unitWeight = Number(product.unitWeightKg || 1) || 1;
+    const scale = unitWeight / totalWeight;
+    const result: Record<string, { itemType: "material" | "product"; amount: number }> = {};
+    Object.entries(raw).forEach(([id, v]) => { result[id] = { itemType: v.itemType, amount: v.amount * scale }; });
+    return result;
+  }
+
+  function indirectConsumptionInPeriod(itemType: "material" | "product", itemId: string, effectiveQty: Record<string, number>): number {
+    let total = 0;
+    Object.entries(effectiveQty).forEach(([productId, qty]) => {
+      const product = data.products.find((p) => p.id === productId);
+      if (!product) return;
+      const perUnit = directConsumptionPerUnitFase3(product);
+      const match = perUnit[itemId];
+      if (match && match.itemType === itemType) total += match.amount * qty;
+    });
+    return total;
+  }
+
+  function transactionsQuantityInPeriod(itemType: "material" | "product", itemId: string): number {
+    return (data.inventoryTransactions || [])
+      .filter((t) => t.itemType === itemType && t.itemId === itemId && t.date >= periodFrom && t.date <= periodTo)
+      .reduce((sum, t) => {
+        if (itemType === "material") {
+          const material = data.materials.find((m) => m.id === itemId);
+          return sum + Number(t.packages || 0) * Number(material?.packageSize || 1) + Number(t.loose || 0);
+        }
+        const product = data.products.find((p) => p.id === itemId);
+        return sum + Number(t.packages || 0) * Number(product?.unitsPerCase || 1) + Number(t.loose || 0);
+      }, 0);
+  }
+
+  function wasteQuantityInPeriodGeneral(itemType: "material" | "product", itemId: string): number {
+    return (data.wasteLog || [])
+      .filter((w) => w.itemType === itemType && w.itemId === itemId && w.date >= periodFrom && w.date <= periodTo)
+      .reduce((sum, w) => sum + Number(w.quantity || 0), 0);
+  }
+
+  function shiftMonthKey(monthKey: string, delta: number): string {
+    const [y, m] = monthKey.split("-").map(Number);
+    const d = new Date(y, m - 1 + delta, 1);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+  }
+
+  function lockedCountQuantity(monthKey: string, itemType: "material" | "product", itemId: string): { counted: boolean; quantity: number } {
+    const monthData = data.inventoryCounts?.[monthKey];
+    if (!monthData?.locked) return { counted: false, quantity: 0 };
+    const key = itemType === "material" ? itemId : `product_${itemId}`;
+    const c = monthData.items?.[key] as any;
+    if (!c) return { counted: true, quantity: 0 };
+    if (itemType === "material") {
+      const material = data.materials.find((m) => m.id === itemId);
+      return { counted: true, quantity: Number(c.packages || 0) * Number(material?.packageSize || 1) + Number(c.loose || 0) };
+    }
+    const product = data.products.find((p) => p.id === itemId);
+    return { counted: true, quantity: Number(c.packages || 0) * Number(product?.unitsPerCase || 1) + Number(c.loose || 0) };
+  }
+
+  const avviksEgenprodusertCategories = ["Kjøkken, egenprodusert", "Bakeri, egenprodusert"];
+  const avviksIsSingleMonth = isWholeSingleMonth(periodFrom, periodTo);
+  const avviksPeriodMonthKey = periodFrom ? periodFrom.slice(0, 7) : "";
+  const avviksPrevMonthKey = avviksPeriodMonthKey ? shiftMonthKey(avviksPeriodMonthKey, -1) : "";
+  const avviksEffectiveQty = effectiveProductQtyInPeriod();
+
+  const avviksRows = !avviksIsSingleMonth ? [] : [
+    ...data.materials.map((m) => ({ itemType: "material" as const, itemId: m.id, name: m.name, unitLabel: m.unit as string, priceRef: m.pricePerUnit || 0 })),
+    ...data.products.filter((p) => avviksEgenprodusertCategories.includes(p.category)).map((p) => ({ itemType: "product" as const, itemId: p.id, name: p.name, unitLabel: "stk", priceRef: productUnitCost(p) })),
+  ]
+    .map((row) => {
+      const opening = lockedCountQuantity(avviksPrevMonthKey, row.itemType, row.itemId);
+      const faktiskTelt = lockedCountQuantity(avviksPeriodMonthKey, row.itemType, row.itemId);
+      const inn = transactionsQuantityInPeriod(row.itemType, row.itemId);
+      const svinn = wasteQuantityInPeriodGeneral(row.itemType, row.itemId);
+      const direkteSalg = row.itemType === "material" ? actualSalesQtyForItem("material", row.itemId) : 0;
+      const forbruk = indirectConsumptionInPeriod(row.itemType, row.itemId, avviksEffectiveQty) + direkteSalg;
+      const forventet = opening.quantity + inn - forbruk - svinn;
+      const avvik = faktiskTelt.quantity - forventet;
+      const avvikValue = avvik * row.priceRef;
+      const avvikPct = forventet !== 0 ? (avvik / forventet) * 100 : (avvik !== 0 ? 100 : 0);
+      return { ...row, opening, faktiskTelt, inn, svinn, forbruk, forventet, avvik, avvikValue, avvikPct };
+    })
+    .filter((r) => r.opening.counted && r.faktiskTelt.counted && (r.opening.quantity !== 0 || r.inn !== 0 || r.forbruk !== 0 || r.svinn !== 0 || r.faktiskTelt.quantity !== 0))
+    .sort((a, b) => Math.abs(b.avvikValue) - Math.abs(a.avvikValue));
+
   // DEL A: månedlig historikk - lagre et øyeblikksbilde av denne opplastingens
   // nøkkeltall for senere sammenligning over tid.
   function saveReportSnapshot() {
@@ -23256,6 +23507,16 @@ function ReportsTab({ data, updateData, productUnitCost, updateInventoryRpc, rea
             </div>
           </div>
 
+          <div className="card" style={{ marginTop: 16 }}>
+            <h3>Faktisk salg fra denne rapporten</h3>
+            <p className="muted" style={{ fontSize: 13 }}>
+              Lagrer solgt antall pr. produkt/råvare for perioden {periodFrom || "..."} – {periodTo || "..."} til "Estimert vs. faktisk telling" lenger ned. Brukes som forbruksgrunnlag for varer uten (eller i tillegg til) produksjon/ordre/leie-sporing i perioden.
+            </p>
+            <button className="btn active" disabled={readOnly || !periodFrom || !periodTo} title={readOnly ? "Du har ikke redigeringstilgang" : undefined} onClick={saveImportedActualSales}>
+              Lagre som faktisk salg for perioden
+            </button>
+          </div>
+
           <details className="soft-box" style={{ padding: 0, marginTop: 16 }}>
             <summary style={{ padding: "12px 16px", fontWeight: 800, cursor: "pointer", listStyle: "none", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
               <span>Historikk <span className="section-toggle-count">{reportHistory.length}</span></span>
@@ -23310,6 +23571,119 @@ function ReportsTab({ data, updateData, productUnitCost, updateInventoryRpc, rea
           </details>
         </>
       )}
+
+      <div className="card" style={{ marginTop: 16 }}>
+        <h3>Estimert vs. faktisk telling (avviksrapport)</h3>
+        <p className="muted" style={{ fontSize: 13 }}>
+          Sammenligner forventet beholdning (siste låste telling + varemottak/produksjon − beregnet forbruk − registrert svinn) mot faktisk fysisk telling for samme måned, for å vise hvor i kjeden et avvik mest sannsynlig oppstår. Krever at BÅDE forrige og valgt måned er låst i Varetelling. Uavhengig av om en Favn-rapport er lastet opp i denne sesjonen.
+        </p>
+        <div className="form-grid two">
+          <label>Fra dato (periodens start)<input type="date" value={periodFrom} disabled={readOnly} onChange={(e) => setPeriodFrom(e.target.value)} /></label>
+          <label>Til dato (periodens slutt)<input type="date" value={periodTo} disabled={readOnly} onChange={(e) => setPeriodTo(e.target.value)} /></label>
+        </div>
+        {periodFrom && periodTo && !avviksIsSingleMonth && (
+          <div className="warning">Perioden må tilsvare én hel kalendermåned for at avviksrapporten skal kunne beregnes.</div>
+        )}
+        {avviksIsSingleMonth && !data.inventoryCounts?.[avviksPrevMonthKey]?.locked && (
+          <div className="warning">Forrige måned ({avviksPrevMonthKey}) er ikke låst ennå - kan ikke beregne åpningsbeholdning.</div>
+        )}
+        {avviksIsSingleMonth && !data.inventoryCounts?.[avviksPeriodMonthKey]?.locked && (
+          <div className="warning">Valgt måned ({avviksPeriodMonthKey}) er ikke låst ennå - lås varetellingen for å se faktisk avvik.</div>
+        )}
+
+        <div className="chips" style={{ marginTop: 12 }}>
+          <span className="muted" style={{ fontSize: 12, marginRight: 4 }}>Faktisk salg brukes:</span>
+          <button className={salesConsumptionMode === "auto" ? "btn active" : "btn"} disabled={readOnly} onClick={() => setSalesConsumptionMode("auto")}>Kun uten sporing (unngå dobbelttelling)</button>
+          <button className={salesConsumptionMode === "always" ? "btn active" : "btn"} disabled={readOnly} onClick={() => setSalesConsumptionMode("always")}>Alltid legg til i tillegg</button>
+        </div>
+
+        <div className="soft-box" style={{ marginTop: 12 }}>
+          <h4 style={{ marginTop: 0 }}>Faktisk salg – manuell registrering</h4>
+          <p className="muted" style={{ fontSize: 12 }}>For produkter/råvarer solgt utenom det som fanges opp av produksjon/ordre/leie i valgt periode.</p>
+          <div className="form-grid three">
+            <label style={{ gridColumn: "span 2" }}>Vare (råvare eller produkt)
+              <div className="search-picker">
+                <input
+                  value={manualSalesSearch || (manualSalesSelected?.name ?? "")}
+                  disabled={readOnly}
+                  onChange={(e) => { setManualSalesSearch(e.target.value); setManualSalesSelected(null); }}
+                  onFocus={() => setManualSalesSearch(manualSalesSearch || "")}
+                  placeholder="Søk vare..."
+                />
+                {manualSalesSearch !== "" && !manualSalesSelected && (
+                  <div className="search-dropdown inline">
+                    {actualSalesCandidates.map((c) => (
+                      <button key={`${c.itemType}-${c.itemId}`} type="button" className="search-result" onClick={() => { setManualSalesSelected(c); setManualSalesSearch(""); }}>
+                        <b>{c.name}</b> <span style={{ color: "#94a3b8", fontSize: 11 }}>{c.itemType === "material" ? "råvare" : "produkt"}</span>
+                      </button>
+                    ))}
+                    {actualSalesCandidates.length === 0 && <div className="search-result" style={{ color: "#94a3b8", cursor: "default" }}>Ingen treff</div>}
+                  </div>
+                )}
+              </div>
+            </label>
+            <label>Solgt antall {manualSalesSelected ? `(${manualSalesSelected.unitLabel})` : ""}
+              <input type="number" disabled={readOnly} value={manualSalesQuantity} onChange={(e) => setManualSalesQuantity(e.target.value)} placeholder="0" />
+            </label>
+          </div>
+          <button className="btn active" style={{ marginTop: 12 }} disabled={readOnly || !manualSalesSelected || !periodFrom || !periodTo} onClick={addManualSalesEntry}>Legg til faktisk salg for perioden</button>
+
+          {actualSalesEntriesInPeriod.length > 0 && (
+            <table style={{ marginTop: 16 }}>
+              <thead><tr><th>Vare</th><th>Kilde</th><th style={{ textAlign: "right" }}>Antall</th><th></th></tr></thead>
+              <tbody>
+                {actualSalesEntriesInPeriod.map((e) => (
+                  <tr key={e.id}>
+                    <td>{actualSalesItemName(e)}</td>
+                    <td>{e.source === "import" ? "Import (Favn)" : "Manuelt"}</td>
+                    <td style={{ textAlign: "right" }}>{e.quantity}</td>
+                    <td><button className="link danger" disabled={readOnly} onClick={() => deleteActualSalesEntry(e.id)}>Slett</button></td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+
+        <div style={{ overflow: "auto", marginTop: 16 }}>
+          <table>
+            <thead>
+              <tr>
+                <th>Vare</th>
+                <th style={{ textAlign: "right" }}>Åpning</th>
+                <th style={{ textAlign: "right" }}>Inn</th>
+                <th style={{ textAlign: "right" }}>Forbruk</th>
+                <th style={{ textAlign: "right" }}>Svinn</th>
+                <th style={{ textAlign: "right" }}>Forventet nå</th>
+                <th style={{ textAlign: "right" }}>Faktisk telt</th>
+                <th style={{ textAlign: "right" }}>Avvik</th>
+                <th style={{ textAlign: "right" }}>Avvik (kr)</th>
+              </tr>
+            </thead>
+            <tbody>
+              {avviksRows.map((r) => {
+                const overThreshold = Math.abs(r.avvikPct) > 15;
+                return (
+                  <tr key={`${r.itemType}-${r.itemId}`} style={overThreshold ? { background: "#fef2f2", color: "#b91c1c" } : undefined}>
+                    <td>{r.name} {r.itemType === "product" && <span style={{ fontSize: 11, color: "#94a3b8" }}>egenprodusert</span>}</td>
+                    <td style={{ textAlign: "right" }}>{num(r.opening.quantity, 1)} {r.unitLabel}</td>
+                    <td style={{ textAlign: "right" }}>+{num(r.inn, 1)}</td>
+                    <td style={{ textAlign: "right" }}>-{num(r.forbruk, 1)}</td>
+                    <td style={{ textAlign: "right" }}>-{num(r.svinn, 1)}</td>
+                    <td style={{ textAlign: "right", fontWeight: 700 }}>{num(r.forventet, 1)} {r.unitLabel}</td>
+                    <td style={{ textAlign: "right" }}>{num(r.faktiskTelt.quantity, 1)} {r.unitLabel}</td>
+                    <td style={{ textAlign: "right", fontWeight: 700 }}>{r.avvik > 0 ? "+" : ""}{num(r.avvik, 1)}</td>
+                    <td style={{ textAlign: "right" }}>{currency(r.avvikValue)}</td>
+                  </tr>
+                );
+              })}
+              {avviksRows.length === 0 && (
+                <tr><td colSpan={9} className="muted">Ingen data å vise ennå for valgt periode - sjekk at begge relevante måneder er låst i Varetelling.</td></tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
 
       <div style={{ marginTop: 16 }}>
         <label style={{ display: "block", marginBottom: 8, maxWidth: 220 }}>
