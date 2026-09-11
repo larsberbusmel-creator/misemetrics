@@ -22924,7 +22924,7 @@ function commissionForRental(rental: RentalOffer, data: AppData): { partner: Com
   return { partner, venueFee, foodDrinkBasis, revenueCut, total: venueFee + revenueCut };
 }
 
-// Rapport-kort for Rapporter-fanen: velg samarbeidspartner, se alle bekreftede leietilbud i
+// Rapport-kort for Rapporter-fanen: velg samarbeidspartner, se alle leietilbud markert "Slått inn" i
 // valgt måned for lokaler koblet til den partneren, med sumlinje og Excel-nedlasting.
 function CommissionPartnerReport({ data, month, readOnly }: { data: AppData; month: string; readOnly: boolean }) {
   const partners = data.commissionPartners || [];
@@ -22934,7 +22934,7 @@ function CommissionPartnerReport({ data, month, readOnly }: { data: AppData; mon
   const rows = useMemo(() => {
     if (!partner) return [];
     return (data.rentalOffers || [])
-      .filter((o) => !!o.confirmedName && (o.date || "").slice(0, 7) === month)
+      .filter((o) => !!o.rungInName && (o.date || "").slice(0, 7) === month)
       .map((o) => ({ offer: o, calc: commissionForRental(o, data) }))
       .filter((r): r is { offer: RentalOffer; calc: NonNullable<ReturnType<typeof commissionForRental>> } => !!r.calc && r.calc.partner.id === partner.id)
       .sort((a, b) => (a.offer.date || "").localeCompare(b.offer.date || ""));
@@ -22992,7 +22992,7 @@ function CommissionPartnerReport({ data, month, readOnly }: { data: AppData; mon
         <span style={{ color: "#64748b", fontSize: 13 }}>▼</span>
       </summary>
       <div style={{ padding: "0 16px 16px" }}>
-        <p className="muted" style={{ fontSize: 13 }}>Viser bekreftede leietilbud i valgt måned for lokaler koblet til valgt samarbeidspartner (fast beløp pr. booking + prosentandel av meny + kasse/bar-salg – servitørkostnad og tilleggslinjer holdes utenfor).</p>
+        <p className="muted" style={{ fontSize: 13 }}>Viser leietilbud markert "Slått inn" i valgt måned for lokaler koblet til valgt samarbeidspartner (fast beløp pr. booking + prosentandel av meny + kasse/bar-salg – servitørkostnad og tilleggslinjer holdes utenfor).</p>
         <label style={{ display: "block", marginBottom: 8, maxWidth: 260 }}>
           Samarbeidspartner
           <select value={partnerId} onChange={(e) => setPartnerId(e.target.value)}>
