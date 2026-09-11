@@ -3209,7 +3209,7 @@ function CalendarDashboard({
   }
 
   function dayOrders(date: string) {
-    return data.orders.filter((o) => o.date === date && !o.deletedAt && (!orderFilter || orderFilter(o))).sort((a, b) => (a.time || "").localeCompare(b.time || ""));
+    return data.orders.filter((o) => o.date && date >= o.date && date <= (o.endDate || o.date) && !o.deletedAt && (!orderFilter || orderFilter(o))).sort((a, b) => (a.time || "").localeCompare(b.time || ""));
   }
   function isRentalOrder(order: Order) {
   return order.recurringNote?.startsWith("Leieavtale:");
