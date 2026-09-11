@@ -19356,6 +19356,7 @@ body{margin:0}
 .menu-footer{text-align:center;margin-top:16px;color:#64748b}
 @media print{
 button{display:none}
+.menu-empty-placeholder{visibility:hidden}
 /* Flex-containere har generelt dårlig støtte i nettlesere for å brytes korrekt over flere fysiske
    print-sider (i motsetning til vanlig blokk-flyt). For 1-spalte-menyer (ingen sideliggende
    spalter å bevare her) faller derfor selve print-utskriften tilbake til vanlig blokk-flyt, slik
@@ -19496,15 +19497,11 @@ function buildMenuHtml(design: MenuDesign, resolvedLogoUrl?: string, opts?: { ed
             <b${dragAttr} data-menu-key="item:${it.id}:name" style="${overriddenStyle(`item:${it.id}:name`, bodyFont, MENU_PAGE.fontPx.body)}${grabStyle}">${escapeHtml(it.name)}</b>
             ${it.price
               ? `<span class="menu-item-price" data-menu-key="item:${it.id}:price" style="${overriddenStyle(`item:${it.id}:price`, bodyFont, MENU_PAGE.fontPx.body)}">${escapeHtml(it.price)}</span>`
-              : opts?.editorPreview
-                ? `<span class="menu-item-price menu-empty-placeholder" data-menu-key="item:${it.id}:price" style="${overriddenStyle(`item:${it.id}:price`, bodyFont, MENU_PAGE.fontPx.body)};color:#94a3b8;font-style:italic;border:1px dashed #cbd5e1;border-radius:4px;padding:0 6px">+ pris</span>`
-                : ""}
+              : `<span class="menu-item-price menu-empty-placeholder" data-menu-key="item:${it.id}:price" style="${overriddenStyle(`item:${it.id}:price`, bodyFont, MENU_PAGE.fontPx.body)};color:#94a3b8;font-style:italic;border:1px dashed #cbd5e1;border-radius:4px;padding:0 6px">+ pris</span>`}
           </div>
           ${it.allergensText
             ? `<p class="menu-item-allergens" data-menu-key="item:${it.id}:allergens" style="${overriddenStyle(`item:${it.id}:allergens`, bodyFont, MENU_PAGE.fontPx.desc, "#94a3b8")}">${escapeHtml(it.allergensText)}</p>`
-            : opts?.editorPreview
-              ? `<p class="menu-item-allergens menu-empty-placeholder" data-menu-key="item:${it.id}:allergens" style="${overriddenStyle(`item:${it.id}:allergens`, bodyFont, MENU_PAGE.fontPx.desc, "#94a3b8")};font-style:italic;border:1px dashed #cbd5e1;border-radius:4px;padding:0 6px;display:inline-block">+ allergener</p>`
-              : ""}
+            : `<p class="menu-item-allergens menu-empty-placeholder" data-menu-key="item:${it.id}:allergens" style="${overriddenStyle(`item:${it.id}:allergens`, bodyFont, MENU_PAGE.fontPx.desc, "#94a3b8")};font-style:italic;border:1px dashed #cbd5e1;border-radius:4px;padding:0 6px;display:inline-block">+ allergener</p>`}
         </div>
       `).join("")}
     </div>
@@ -19533,9 +19530,7 @@ function buildMenuHtml(design: MenuDesign, resolvedLogoUrl?: string, opts?: { ed
     const fallbackFamily = isHeading ? headingFont : bodyFont;
     const fallbackPx = isHeading ? MENU_PAGE.fontPx.section : MENU_PAGE.fontPx.body;
     if (!b.text.trim()) {
-      return opts?.editorPreview
-        ? `<p class="${cls} menu-empty-placeholder"${dragAttr} data-menu-key="textblock:${b.id}" data-menu-block="textblock:${b.id}" style="${overriddenStyle(`textblock:${b.id}`, fallbackFamily, fallbackPx)};color:#94a3b8;font-style:italic;border:1px dashed #cbd5e1;border-radius:4px;padding:0 6px;display:inline-block;cursor:grab">${isHeading ? "+ overskrift" : "+ tekstfelt"}</p>`
-        : "";
+      return `<p class="${cls} menu-empty-placeholder"${dragAttr} data-menu-key="textblock:${b.id}" data-menu-block="textblock:${b.id}" style="${overriddenStyle(`textblock:${b.id}`, fallbackFamily, fallbackPx)};color:#94a3b8;font-style:italic;border:1px dashed #cbd5e1;border-radius:4px;padding:0 6px;display:inline-block;cursor:grab">${isHeading ? "+ overskrift" : "+ tekstfelt"}</p>`;
     }
     return `<p class="${cls}"${dragAttr} data-menu-key="textblock:${b.id}" data-menu-block="textblock:${b.id}" style="${overriddenStyle(`textblock:${b.id}`, fallbackFamily, fallbackPx)}${grabStyle}">${escapeHtml(b.text)}</p>`;
   }
@@ -19619,9 +19614,7 @@ function buildMenuHtml(design: MenuDesign, resolvedLogoUrl?: string, opts?: { ed
       ${freeSectionsHtml}
       ${design.menuPrice
         ? `<div class="menu-price" data-menu-key="menuPrice" style="${overriddenStyle("menuPrice", bodyFont, MENU_PAGE.fontPx.title, "#111827")}">${escapeHtml(design.menuPrice)}</div>`
-        : opts?.editorPreview
-          ? `<div class="menu-price menu-empty-placeholder" data-menu-key="menuPrice" style="${overriddenStyle("menuPrice", bodyFont, MENU_PAGE.fontPx.title, "#111827")};font-style:italic;color:#94a3b8;border:1px dashed #cbd5e1;border-radius:4px;padding:0 6px;display:inline-block">+ menypris</div>`
-          : ""}
+        : `<div class="menu-price menu-empty-placeholder" data-menu-key="menuPrice" style="${overriddenStyle("menuPrice", bodyFont, MENU_PAGE.fontPx.title, "#111827")};font-style:italic;color:#94a3b8;border:1px dashed #cbd5e1;border-radius:4px;padding:0 6px;display:inline-block">+ menypris</div>`}
       ${design.footerText ? `<div class="menu-footer" data-menu-key="footer" style="${overriddenStyle("footer", bodyFont, MENU_PAGE.fontPx.footer, "#64748b")}">${escapeHtml(design.footerText)}</div>` : ""}
     </div>
   `;
