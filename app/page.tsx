@@ -19329,6 +19329,7 @@ function menuDesignStyleTag(orientation?: "portrait" | "landscape") {
 @page{size:A4${orientation === "landscape" ? " landscape" : ""};margin:0}
 body{margin:0}
 .menu-page{position:relative;width:${pageWidthMm}mm;min-height:${pageHeightMm}mm;padding:${MENU_PAGE.marginMm}mm;box-sizing:border-box;display:flex;flex-direction:column;color:#111827}
+.menu-page-break-guides{position:absolute;inset:0;z-index:5;pointer-events:none;background-image:repeating-linear-gradient(to bottom, transparent 0mm, transparent calc(${pageHeightMm}mm - 0.5mm), #ef4444 calc(${pageHeightMm}mm - 0.5mm), #ef4444 ${pageHeightMm}mm)}
 .menu-logo{object-fit:contain;margin:0 auto 6mm;display:block}
 .menu-title{text-align:center;font-weight:700;margin-bottom:20px}
 .menu-main{flex:1;display:flex;flex-direction:column;min-height:0}
@@ -19353,6 +19354,7 @@ body{margin:0}
 .menu-add-item-row{margin-top:4px;padding:2px 8px;border:1px dashed #cbd5e1;border-radius:6px;color:#64748b;font-size:12px;font-style:italic;cursor:pointer;display:inline-block}
 .pdf-export .menu-empty-placeholder{visibility:hidden}
 .pdf-export .menu-add-item-row{display:none}
+.pdf-export .menu-page-break-guides{display:none}
 .menu-footer{text-align:center;margin-top:16px;color:#64748b}
 @media print{
 button{display:none}
@@ -19606,6 +19608,7 @@ function buildMenuHtml(design: MenuDesign, resolvedLogoUrl?: string, opts?: { ed
   return `
     <div class="menu-page" data-columns="${design.columns}" style="font-family:${bodyFont};font-size:${px(MENU_PAGE.fontPx.body)}">
       <div class="menu-page-background" style="${menuBackgroundCss(design, opts?.resolvedBackgroundImageUrl)}"></div>
+      ${opts?.editorPreview ? `<div class="menu-page-break-guides"></div>` : ""}
       ${resolvedLogoUrl ? `<img class="menu-logo" style="max-height:${logoSize.maxHeightMm}mm;max-width:${logoSize.maxWidthPct}%" src="${resolvedLogoUrl}" alt="Logo" />` : ""}
       <div class="menu-main">
         ${columnsBlock}
