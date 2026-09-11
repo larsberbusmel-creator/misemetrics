@@ -322,6 +322,18 @@ type RentalOffer = {
 
 type Venue = { id: string; name: string; price: number; roomIds?: string[] };
 
+// Samarbeidspartnere: eventbyråer/huseiere som skal ha en fast sum + prosentandel av
+// mat/drikke-omsetningen når vi bruker et av deres lokaler (venueIds matcher Venue.id).
+type CommissionPartner = {
+  id: string;
+  name: string;
+  venueIds: string[];
+  venueFeeFixedAmount: number;
+  revenueSharePercent: number;
+  note?: string;
+  createdAt?: string;
+};
+
 type Settings = {
   foodVat: number;
   notificationEmails?: string[];
@@ -866,6 +878,7 @@ type AppData = {
   settings: Settings;
   rental: RentalOffer;
   venues: Venue[];
+  commissionPartners: CommissionPartner[];
   packaging: Packaging[];
   rentalAddons: RentalAddon[];
   productLists: ProductList[];
@@ -1226,7 +1239,7 @@ settings: {
     Cider: 70,
   },
 },
-rental: { customer: "", venue: "Kaféen", venuePrice: 11000, waiters: 1, waiterHours: 0, waiterAfterMidnightHours: 0, productLines: [], extraLines: [] },  venues: [{ id: "kafeen", name: "Kaféen", price: 11000 }, { id: "oscarshall", name: "Oscarshall", price: 18000 }, { id: "gammelfloya", name: "Gammelfløya", price: 18000 }, { id: "bodogaard", name: "Bodøgaard hel helg", price: 24000 }],
+rental: { customer: "", venue: "Kaféen", venuePrice: 11000, waiters: 1, waiterHours: 0, waiterAfterMidnightHours: 0, productLines: [], extraLines: [] },  venues: [{ id: "kafeen", name: "Kaféen", price: 11000 }, { id: "oscarshall", name: "Oscarshall", price: 18000 }, { id: "gammelfloya", name: "Gammelfløya", price: 18000 }, { id: "bodogaard", name: "Bodøgaard hel helg", price: 24000 }],  commissionPartners: [],
   packaging: [{ id: "glass", name: "Glass", price: 8 }, { id: "brodpose", name: "Brødpose", price: 2.5 }, { id: "aluminiumsbakke", name: "Aluminiumsbakke", price: 12 }],
   rentalAddons: defaultRentalAddons,
   productLists: [],
@@ -22890,6 +22903,138 @@ type MatchedArticle = ParsedArticle & (
   | { itemType: "material"; itemId: string; material: Material }
 );
 
+// Regner ut hva en samarbeidspartner skal ha for ETT leietilbud - fast beløp (hvis lokalet
+// er koblet til en partner) + prosentandel av mat (menyvalg) og drikke (kasse/bar-salg).
+// Speiler EKSAKT samme food/effectiveBarTotal-utregning som RentalTab selv bruker til
+// prisberegningen på tilbudet, slik at tallene her alltid stemmer med det som faktisk vises der.
+function commissionForRental(rental: RentalOffer, data: AppData): { partner: CommissionPartner; venueFee: number; foodDrinkBasis: number; revenueCut: number; total: number } | null {
+  if (rental.venueExternal || !rental.venue) return null;
+  const venue = data.venues.find((v) => v.name === rental.venue);
+  if (!venue) return null;
+  const partner = (data.commissionPartners || []).find((p) => (p.venueIds || []).includes(venue.id));
+  if (!partner) return null;
+  const food = rental.productLines.reduce((sum, l) => sum + (data.products.find((p) => p.id === l.productId)?.customerPrice || 0) * l.guests, 0);
+  const barTallyEntriesForOffer = (data.barTallyEntries || []).filter((e) => e.offerId === rental.id && !e.deletedAt);
+  const barTotal = barTallyEntriesForOffer.reduce((sum, e) => sum + e.itemPrice, 0);
+  const effectiveBarTotal = rental.barLocked ? (rental.barLockedTotal || 0) : barTotal;
+  const foodDrinkBasis = food + effectiveBarTotal;
+  const revenueCut = foodDrinkBasis * (partner.revenueSharePercent || 0) / 100;
+  const venueFee = partner.venueFeeFixedAmount || 0;
+  return { partner, venueFee, foodDrinkBasis, revenueCut, total: venueFee + revenueCut };
+}
+
+// Rapport-kort for Rapporter-fanen: velg samarbeidspartner, se alle bekreftede leietilbud i
+// valgt måned for lokaler koblet til den partneren, med sumlinje og Excel-nedlasting.
+function CommissionPartnerReport({ data, month, readOnly }: { data: AppData; month: string; readOnly: boolean }) {
+  const partners = data.commissionPartners || [];
+  const [partnerId, setPartnerId] = useState(partners[0]?.id || "");
+  const partner = partners.find((p) => p.id === partnerId);
+
+  const rows = useMemo(() => {
+    if (!partner) return [];
+    return (data.rentalOffers || [])
+      .filter((o) => !!o.confirmedName && (o.date || "").slice(0, 7) === month)
+      .map((o) => ({ offer: o, calc: commissionForRental(o, data) }))
+      .filter((r): r is { offer: RentalOffer; calc: NonNullable<ReturnType<typeof commissionForRental>> } => !!r.calc && r.calc.partner.id === partner.id)
+      .sort((a, b) => (a.offer.date || "").localeCompare(b.offer.date || ""));
+  }, [data, month, partner]);
+
+  const sumRevenueCut = rows.reduce((sum, r) => sum + r.calc.revenueCut, 0);
+  const sumTotal = rows.reduce((sum, r) => sum + r.calc.total, 0);
+
+  async function exportPartnerXlsx() {
+    if (!partner) return;
+    const ExcelJS = await import("exceljs");
+    const wb = new ExcelJS.Workbook();
+    const ws = wb.addWorksheet("Rapport");
+    ws.columns = [{ width: 14 }, { width: 28 }, { width: 22 }, { width: 14 }, { width: 14 }, { width: 16 }, { width: 16 }, { width: 16 }];
+    const titleRow = ws.addRow([`${partner.name} – ${month}`]);
+    ws.mergeCells(1, 1, 1, 8);
+    titleRow.getCell(1).font = { bold: true, size: 14, color: { argb: "FFFFFFFF" } };
+    titleRow.getCell(1).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF166534" } };
+    titleRow.getCell(1).alignment = { horizontal: "center", vertical: "middle" };
+    titleRow.height = 28;
+    ws.addRow([]);
+    const headerRow = ws.addRow(["Dato", "Kunde", "Lokale", "Leiepris", "Fast beløp", "Mat+drikke", `Kutt (${partner.revenueSharePercent}%)`, "Sum til partner"]);
+    headerRow.eachCell((cell: any) => { cell.font = { bold: true, color: { argb: "FFFFFFFF" } }; cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF166534" } }; cell.border = { top: { style: "thin" }, bottom: { style: "thin" }, left: { style: "thin" }, right: { style: "thin" } }; });
+    rows.forEach((r) => {
+      const row = ws.addRow([formatDateNo(r.offer.date || ""), r.offer.customer, r.offer.venue, r.offer.venuePrice, r.calc.venueFee, r.calc.foodDrinkBasis, r.calc.revenueCut, r.calc.total]);
+      row.eachCell((cell: any, colNumber: number) => { cell.border = { top: { style: "hair" }, bottom: { style: "hair" }, left: { style: "thin" }, right: { style: "thin" } }; if (colNumber >= 4) cell.numFmt = "#,##0.00"; });
+    });
+    const sumRow = ws.addRow(["SUM", "", "", "", "", "", sumRevenueCut, sumTotal]);
+    sumRow.eachCell((cell: any, colNumber: number) => { cell.font = { bold: true }; cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "44166534" } }; cell.border = { top: { style: "medium" }, bottom: { style: "medium" }, left: { style: "medium" }, right: { style: "medium" } }; if (colNumber >= 4) cell.numFmt = "#,##0.00"; });
+    const buffer = await wb.xlsx.writeBuffer();
+    const blob = new Blob([buffer], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `${idFromName(partner.name)}-${month}.xlsx`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  if (partners.length === 0) {
+    return (
+      <details className="soft-box" style={{ padding: 0 }}>
+        <summary style={{ padding: "12px 16px", fontWeight: 800, cursor: "pointer", listStyle: "none" }}>Samarbeidspartner-rapport</summary>
+        <div style={{ padding: "0 16px 16px" }}>
+          <p className="muted">Ingen samarbeidspartnere lagt inn ennå – legg til under Innstillinger → Leie av lokale, samarbeidspartnere.</p>
+        </div>
+      </details>
+    );
+  }
+
+  return (
+    <details className="soft-box" style={{ padding: 0 }}>
+      <summary style={{ padding: "12px 16px", fontWeight: 800, cursor: "pointer", listStyle: "none", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+        <span>Samarbeidspartner-rapport ({month})</span>
+        <span style={{ color: "#64748b", fontSize: 13 }}>▼</span>
+      </summary>
+      <div style={{ padding: "0 16px 16px" }}>
+        <p className="muted" style={{ fontSize: 13 }}>Viser bekreftede leietilbud i valgt måned for lokaler koblet til valgt samarbeidspartner (fast beløp pr. booking + prosentandel av meny + kasse/bar-salg – servitørkostnad og tilleggslinjer holdes utenfor).</p>
+        <label style={{ display: "block", marginBottom: 8, maxWidth: 260 }}>
+          Samarbeidspartner
+          <select value={partnerId} onChange={(e) => setPartnerId(e.target.value)}>
+            {partners.map((p) => <option key={p.id} value={p.id}>{p.name}</option>)}
+          </select>
+        </label>
+        <table>
+          <thead>
+            <tr>
+              <th>Dato</th><th>Kunde</th><th>Lokale</th><th>Leiepris</th><th>Fast beløp</th><th>Mat+drikke</th><th>Kutt</th><th>Sum til partner</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r) => (
+              <tr key={r.offer.id}>
+                <td>{formatDateNo(r.offer.date || "")}</td>
+                <td>{r.offer.customer}</td>
+                <td>{r.offer.venue}</td>
+                <td>{currency(r.offer.venuePrice)}</td>
+                <td>{currency(r.calc.venueFee)}</td>
+                <td>{currency(r.calc.foodDrinkBasis)}</td>
+                <td>{currency(r.calc.revenueCut)}</td>
+                <td><b>{currency(r.calc.total)}</b></td>
+              </tr>
+            ))}
+            {rows.length === 0 && <tr><td colSpan={8} className="muted">Ingen bekreftede bookinger for denne partneren i valgt måned.</td></tr>}
+          </tbody>
+          {rows.length > 0 && (
+            <tfoot>
+              <tr style={{ fontWeight: 800 }}>
+                <td colSpan={6}>SUM</td>
+                <td>{currency(sumRevenueCut)}</td>
+                <td>{currency(sumTotal)}</td>
+              </tr>
+            </tfoot>
+          )}
+        </table>
+        <button className="btn active" style={{ marginTop: 12 }} disabled={readOnly || rows.length === 0} onClick={exportPartnerXlsx}>Last ned Excel</button>
+      </div>
+    </details>
+  );
+}
+
 function ReportsTab({ data, updateData, productUnitCost, updateInventoryRpc, readOnly }: {
   data: AppData;
   updateData: (p: Partial<AppData>) => void;
@@ -23877,6 +24022,10 @@ function ReportsTab({ data, updateData, productUnitCost, updateInventoryRpc, rea
       </div>
 
       <div style={{ marginTop: 16 }}>
+        <CommissionPartnerReport data={data} month={reportMonth} readOnly={readOnly} />
+      </div>
+
+      <div style={{ marginTop: 16 }}>
         <button className="btn active" onClick={() => setShowCrossProductStats((v) => !v)}>
           {showCrossProductStats ? "Skjul produktstatistikk" : "Produktstatistikk (Ordre / Leie av lokale / Produksjon)"}
         </button>
@@ -24121,6 +24270,8 @@ function removeBarTemplateItem(templateId: string, itemId: string) {
 
   const [localSettings, setLocalSettings] = useState(data.settings);
   const [localVenues, setLocalVenues] = useState(data.venues);
+  const [localPartners, setLocalPartners] = useState(data.commissionPartners || []);
+  const [newPartner, setNewPartner] = useState({ name: "", venueFeeFixedAmount: "0", revenueSharePercent: "5" });
   const [localPackaging, setLocalPackaging] = useState(data.packaging);
   const [localRentalAddons, setLocalRentalAddons] = useState(data.rentalAddons);
   const [localBarTemplates, setLocalBarTemplates] = useState(data.barTemplates || []);
@@ -24263,6 +24414,85 @@ function removeBarTemplateItem(templateId: string, itemId: string) {
             setLocalVenues(next);
             updateData({ venues: next });
             setNewVenue({ name: "", price: "0" });
+          }}>Legg til</button>
+        </div>
+      </Section>
+
+      <Section id="commissionPartners" title="Leie av lokale, samarbeidspartnere">
+        <p className="muted" style={{ fontSize: 13 }}>Eventbyråer/huseiere som skal ha en fast sum pr. booking av ett eller flere av lokalene over, pluss en prosentandel av det vi selger av mat og drikke (meny + kasse/bar) på akkurat den bookingen. Servitørkostnad og tilleggslinjer (dekketøy, utstyr o.l.) regnes ikke med i prosentandelen.</p>
+        <div>
+          {localPartners.map((partner, i) => (
+            <div key={partner.id} className="editable-row" style={{ flexWrap: "wrap" }}>
+              <input
+                value={partner.name}
+                onChange={(e) => setLocalPartners(localPartners.map((x, ix) => ix === i ? { ...x, name: e.target.value } : x))}
+                onBlur={() => updateData({ commissionPartners: localPartners })}
+                disabled={readOnly}
+                style={{ flex: "2 1 200px" }}
+              />
+              <label style={{ fontSize: 12, color: "#64748b" }}>Fast beløp
+                <input
+                  type="number"
+                  value={partner.venueFeeFixedAmount}
+                  onChange={(e) => setLocalPartners(localPartners.map((x, ix) => ix === i ? { ...x, venueFeeFixedAmount: Number(e.target.value) || 0 } : x))}
+                  onBlur={() => updateData({ commissionPartners: localPartners })}
+                  disabled={readOnly}
+                  style={{ width: 100 }}
+                />
+              </label>
+              <label style={{ fontSize: 12, color: "#64748b" }}>% av mat/drikke
+                <input
+                  type="number"
+                  value={partner.revenueSharePercent}
+                  onChange={(e) => setLocalPartners(localPartners.map((x, ix) => ix === i ? { ...x, revenueSharePercent: Number(e.target.value) || 0 } : x))}
+                  onBlur={() => updateData({ commissionPartners: localPartners })}
+                  disabled={readOnly}
+                  style={{ width: 80 }}
+                />
+              </label>
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 4, alignItems: "center" }}>
+                <span style={{ fontSize: 12, color: "#64748b" }}>Lokaler:</span>
+                {localVenues.map((v) => {
+                  const active = (partner.venueIds || []).includes(v.id);
+                  return (
+                    <button
+                      key={v.id}
+                      type="button"
+                      className={active ? "btn active" : "btn"}
+                      style={{ padding: "2px 8px", fontSize: 12 }}
+                      disabled={readOnly}
+                      title={readOnly ? "Du har ikke redigeringstilgang" : undefined}
+                      onClick={() => {
+                        const venueIds = active ? (partner.venueIds || []).filter((id) => id !== v.id) : [...(partner.venueIds || []), v.id];
+                        const next = localPartners.map((x, ix) => ix === i ? { ...x, venueIds } : x);
+                        setLocalPartners(next);
+                        updateData({ commissionPartners: next });
+                      }}
+                    >
+                      {v.name}
+                    </button>
+                  );
+                })}
+                {localVenues.length === 0 && <span style={{ fontSize: 12, color: "#94a3b8" }}>Ingen lokaler lagret ennå</span>}
+              </div>
+              <button className="link danger" disabled={readOnly} title={readOnly ? "Du har ikke redigeringstilgang" : undefined} onClick={() => {
+                const next = localPartners.filter((x) => x.id !== partner.id);
+                setLocalPartners(next);
+                updateData({ commissionPartners: next });
+              }}>Slett</button>
+            </div>
+          ))}
+        </div>
+        <div className="form-grid three">
+          <input placeholder="Navn på samarbeidspartner" value={newPartner.name} onChange={(e) => setNewPartner({ ...newPartner, name: e.target.value })} disabled={readOnly} />
+          <input type="number" placeholder="Fast beløp" value={newPartner.venueFeeFixedAmount} onChange={(e) => setNewPartner({ ...newPartner, venueFeeFixedAmount: e.target.value })} disabled={readOnly} />
+          <input type="number" placeholder="% av mat/drikke" value={newPartner.revenueSharePercent} onChange={(e) => setNewPartner({ ...newPartner, revenueSharePercent: e.target.value })} disabled={readOnly} />
+          <button className="btn active" disabled={readOnly} title={readOnly ? "Du har ikke redigeringstilgang" : undefined} onClick={() => {
+            if (!newPartner.name.trim()) return;
+            const next = [...localPartners, { id: `${idFromName(newPartner.name)}-${Date.now()}`, name: newPartner.name.trim(), venueIds: [] as string[], venueFeeFixedAmount: Number(newPartner.venueFeeFixedAmount) || 0, revenueSharePercent: Number(newPartner.revenueSharePercent) || 0, createdAt: new Date().toISOString() }];
+            setLocalPartners(next);
+            updateData({ commissionPartners: next });
+            setNewPartner({ name: "", venueFeeFixedAmount: "0", revenueSharePercent: "5" });
           }}>Legg til</button>
         </div>
       </Section>
