@@ -328,7 +328,8 @@ type CommissionPartner = {
   id: string;
   name: string;
   venueIds: string[];
-  venueFeeFixedAmount: number;
+  venueFees: Record<string, number>; // lokale-id -> fast beløp pr. booking for akkurat det lokalet
+  venueFeeFixedAmount?: number; // UTGÅTT - ett globalt fast beløp fra første versjon av funksjonen, beholdes kun som fallback for partnere opprettet før dette ble lokale-spesifikt
   revenueSharePercent: number;
   note?: string;
   createdAt?: string;
@@ -22919,7 +22920,7 @@ function commissionForRental(rental: RentalOffer, data: AppData): { partner: Com
   const effectiveBarTotal = rental.barLocked ? (rental.barLockedTotal || 0) : barTotal;
   const foodDrinkBasis = food + effectiveBarTotal;
   const revenueCut = foodDrinkBasis * (partner.revenueSharePercent || 0) / 100;
-  const venueFee = partner.venueFeeFixedAmount || 0;
+  const venueFee = (partner.venueFees || {})[venue.id] ?? partner.venueFeeFixedAmount ?? 0;
   return { partner, venueFee, foodDrinkBasis, revenueCut, total: venueFee + revenueCut };
 }
 
@@ -24271,7 +24272,7 @@ function removeBarTemplateItem(templateId: string, itemId: string) {
   const [localSettings, setLocalSettings] = useState(data.settings);
   const [localVenues, setLocalVenues] = useState(data.venues);
   const [localPartners, setLocalPartners] = useState(data.commissionPartners || []);
-  const [newPartner, setNewPartner] = useState({ name: "", venueFeeFixedAmount: "0", revenueSharePercent: "5" });
+  const [newPartner, setNewPartner] = useState({ name: "", revenueSharePercent: "5" });
   const [localPackaging, setLocalPackaging] = useState(data.packaging);
   const [localRentalAddons, setLocalRentalAddons] = useState(data.rentalAddons);
   const [localBarTemplates, setLocalBarTemplates] = useState(data.barTemplates || []);
@@ -24430,16 +24431,6 @@ function removeBarTemplateItem(templateId: string, itemId: string) {
                 disabled={readOnly}
                 style={{ flex: "2 1 200px" }}
               />
-              <label style={{ fontSize: 12, color: "#64748b" }}>Fast beløp
-                <input
-                  type="number"
-                  value={partner.venueFeeFixedAmount}
-                  onChange={(e) => setLocalPartners(localPartners.map((x, ix) => ix === i ? { ...x, venueFeeFixedAmount: Number(e.target.value) || 0 } : x))}
-                  onBlur={() => updateData({ commissionPartners: localPartners })}
-                  disabled={readOnly}
-                  style={{ width: 100 }}
-                />
-              </label>
               <label style={{ fontSize: 12, color: "#64748b" }}>% av mat/drikke
                 <input
                   type="number"
@@ -24450,30 +24441,49 @@ function removeBarTemplateItem(templateId: string, itemId: string) {
                   style={{ width: 80 }}
                 />
               </label>
-              <div style={{ display: "flex", flexWrap: "wrap", gap: 4, alignItems: "center" }}>
-                <span style={{ fontSize: 12, color: "#64748b" }}>Lokaler:</span>
-                {localVenues.map((v) => {
-                  const active = (partner.venueIds || []).includes(v.id);
-                  return (
-                    <button
-                      key={v.id}
-                      type="button"
-                      className={active ? "btn active" : "btn"}
-                      style={{ padding: "2px 8px", fontSize: 12 }}
-                      disabled={readOnly}
-                      title={readOnly ? "Du har ikke redigeringstilgang" : undefined}
-                      onClick={() => {
-                        const venueIds = active ? (partner.venueIds || []).filter((id) => id !== v.id) : [...(partner.venueIds || []), v.id];
-                        const next = localPartners.map((x, ix) => ix === i ? { ...x, venueIds } : x);
-                        setLocalPartners(next);
-                        updateData({ commissionPartners: next });
-                      }}
-                    >
-                      {v.name}
-                    </button>
-                  );
-                })}
-                {localVenues.length === 0 && <span style={{ fontSize: 12, color: "#94a3b8" }}>Ingen lokaler lagret ennå</span>}
+              <div style={{ display: "flex", flexDirection: "column", gap: 4, width: "100%" }}>
+                <span style={{ fontSize: 12, color: "#64748b" }}>Lokaler og fast beløp pr. booking:</span>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 8, alignItems: "center" }}>
+                  {localVenues.map((v) => {
+                    const active = (partner.venueIds || []).includes(v.id);
+                    return (
+                      <div key={v.id} style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                        <button
+                          type="button"
+                          className={active ? "btn active" : "btn"}
+                          style={{ padding: "2px 8px", fontSize: 12 }}
+                          disabled={readOnly}
+                          title={readOnly ? "Du har ikke redigeringstilgang" : undefined}
+                          onClick={() => {
+                            const venueIds = active ? (partner.venueIds || []).filter((id) => id !== v.id) : [...(partner.venueIds || []), v.id];
+                            const venueFees = { ...(partner.venueFees || {}) };
+                            if (!active && venueFees[v.id] === undefined) venueFees[v.id] = partner.venueFeeFixedAmount ?? 0;
+                            const next = localPartners.map((x, ix) => ix === i ? { ...x, venueIds, venueFees } : x);
+                            setLocalPartners(next);
+                            updateData({ commissionPartners: next });
+                          }}
+                        >
+                          {v.name}
+                        </button>
+                        {active && (
+                          <input
+                            type="number"
+                            value={(partner.venueFees || {})[v.id] ?? partner.venueFeeFixedAmount ?? 0}
+                            onChange={(e) => {
+                              const venueFees = { ...(partner.venueFees || {}), [v.id]: Number(e.target.value) || 0 };
+                              setLocalPartners(localPartners.map((x, ix) => ix === i ? { ...x, venueFees } : x));
+                            }}
+                            onBlur={() => updateData({ commissionPartners: localPartners })}
+                            disabled={readOnly}
+                            title={`Fast beløp for ${v.name}`}
+                            style={{ width: 90, fontSize: 12 }}
+                          />
+                        )}
+                      </div>
+                    );
+                  })}
+                  {localVenues.length === 0 && <span style={{ fontSize: 12, color: "#94a3b8" }}>Ingen lokaler lagret ennå</span>}
+                </div>
               </div>
               <button className="link danger" disabled={readOnly} title={readOnly ? "Du har ikke redigeringstilgang" : undefined} onClick={() => {
                 const next = localPartners.filter((x) => x.id !== partner.id);
@@ -24485,14 +24495,13 @@ function removeBarTemplateItem(templateId: string, itemId: string) {
         </div>
         <div className="form-grid three">
           <input placeholder="Navn på samarbeidspartner" value={newPartner.name} onChange={(e) => setNewPartner({ ...newPartner, name: e.target.value })} disabled={readOnly} />
-          <input type="number" placeholder="Fast beløp" value={newPartner.venueFeeFixedAmount} onChange={(e) => setNewPartner({ ...newPartner, venueFeeFixedAmount: e.target.value })} disabled={readOnly} />
           <input type="number" placeholder="% av mat/drikke" value={newPartner.revenueSharePercent} onChange={(e) => setNewPartner({ ...newPartner, revenueSharePercent: e.target.value })} disabled={readOnly} />
           <button className="btn active" disabled={readOnly} title={readOnly ? "Du har ikke redigeringstilgang" : undefined} onClick={() => {
             if (!newPartner.name.trim()) return;
-            const next = [...localPartners, { id: `${idFromName(newPartner.name)}-${Date.now()}`, name: newPartner.name.trim(), venueIds: [] as string[], venueFeeFixedAmount: Number(newPartner.venueFeeFixedAmount) || 0, revenueSharePercent: Number(newPartner.revenueSharePercent) || 0, createdAt: new Date().toISOString() }];
+            const next = [...localPartners, { id: `${idFromName(newPartner.name)}-${Date.now()}`, name: newPartner.name.trim(), venueIds: [] as string[], venueFees: {} as Record<string, number>, revenueSharePercent: Number(newPartner.revenueSharePercent) || 0, createdAt: new Date().toISOString() }];
             setLocalPartners(next);
             updateData({ commissionPartners: next });
-            setNewPartner({ name: "", venueFeeFixedAmount: "0", revenueSharePercent: "5" });
+            setNewPartner({ name: "", revenueSharePercent: "5" });
           }}>Legg til</button>
         </div>
       </Section>
