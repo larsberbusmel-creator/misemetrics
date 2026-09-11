@@ -328,7 +328,8 @@ type CommissionPartner = {
   id: string;
   name: string;
   venueIds: string[];
-  venueFees: Record<string, number>; // lokale-id -> fast beløp pr. booking for akkurat det lokalet
+  venueFees: Record<string, number>; // lokale-id -> fast beløp EKS. MVA pr. booking for akkurat det lokalet
+  venueFeeVatRates?: Record<string, 15 | 25>; // NY - lokale-id -> mva-sats for det faste beløpet (standard 25%, siden leie av lokale normalt er en tjeneste)
   venueFeeFixedAmount?: number; // UTGÅTT - ett globalt fast beløp fra første versjon av funksjonen, beholdes kun som fallback for partnere opprettet før dette ble lokale-spesifikt
   revenueSharePercent: number;
   note?: string;
@@ -346,6 +347,7 @@ type Settings = {
   waiterHourlyRate: number;
   waiterAfterMidnightHourlyRate: number;
   retailMargins?: Record<string, number>;
+  vatRateByCategory?: Record<string, 0 | 15 | 25>; // NY - momssats pr. råvarekategori, brukt i Samarbeidspartner-rapportens mat/drikke-fordeling
 };
 
 type LocationCount = { packages: number; loose: number };
@@ -1147,6 +1149,17 @@ function exVatFromIncVat(amountIncVat: number, vatRate: number) {
 
 function vatAmountFromIncVat(amountIncVat: number, vatRate: number) {
   return amountIncVat - exVatFromIncVat(amountIncVat, vatRate);
+}
+
+// Slår opp momssats (0/15/25%) for en råvarekategori - styres av Settings.vatRateByCategory
+// (redigeres i Innstillinger → Kategorier for råvarer), med samme standardgjetning
+// (Øl/Vin/Brennevin/Cider = 25%, resten = 15%) som i dag hvis kategorien ikke er satt eksplisitt.
+// Brukes foreløpig KUN i Samarbeidspartner-rapporten - IKKE i den eksisterende
+// prisforslag-logikken for videresalg av råvarer, som har sin egen spesialhåndtering.
+function vatRateForMaterialCategory(category: string, data: AppData): 0 | 15 | 25 {
+  const configured = data.settings.vatRateByCategory?.[category];
+  if (configured === 0 || configured === 15 || configured === 25) return configured;
+  return ["Øl", "Vin", "Brennevin", "Cider"].includes(category) ? 25 : 15;
 }
 
 function marginPercentFrom(priceExVat: number, cost: number) {
@@ -22905,23 +22918,59 @@ type MatchedArticle = ParsedArticle & (
 );
 
 // Regner ut hva en samarbeidspartner skal ha for ETT leietilbud - fast beløp (hvis lokalet
-// er koblet til en partner) + prosentandel av mat (menyvalg) og drikke (kasse/bar-salg).
+// er koblet til en partner) + prosentandel av mat (menyvalg) og drikke (kasse/bar-salg),
+// splittet på 0%/15%/25% momsgrunnlag hver for seg (styrt av momssats pr. råvarekategori).
 // Speiler EKSAKT samme food/effectiveBarTotal-utregning som RentalTab selv bruker til
 // prisberegningen på tilbudet, slik at tallene her alltid stemmer med det som faktisk vises der.
-function commissionForRental(rental: RentalOffer, data: AppData): { partner: CommissionPartner; venueFee: number; foodDrinkBasis: number; revenueCut: number; total: number } | null {
+function commissionForRental(rental: RentalOffer, data: AppData): {
+  partner: CommissionPartner;
+  venueFee: number;
+  venueFeeVatRate: number;
+  basis0: number;
+  basis15: number;
+  basis25: number;
+  foodDrinkBasis: number;
+  revenueCut0: number;
+  revenueCut15: number;
+  revenueCut25: number;
+  revenueCut: number;
+  total: number;
+} | null {
   if (rental.venueExternal || !rental.venue) return null;
   const venue = data.venues.find((v) => v.name === rental.venue);
   if (!venue) return null;
   const partner = (data.commissionPartners || []).find((p) => (p.venueIds || []).includes(venue.id));
   if (!partner) return null;
-  const food = rental.productLines.reduce((sum, l) => sum + (data.products.find((p) => p.id === l.productId)?.customerPrice || 0) * l.guests, 0);
+  // Menyvalg (mat) regnes alltid som matmoms (15%) - menyproduktene har ingen egen momssats-kategori i dag.
+  const matFromMenu = rental.productLines.reduce((sum, l) => sum + (data.products.find((p) => p.id === l.productId)?.customerPrice || 0) * l.guests, 0);
   const barTallyEntriesForOffer = (data.barTallyEntries || []).filter((e) => e.offerId === rental.id && !e.deletedAt);
-  const barTotal = barTallyEntriesForOffer.reduce((sum, e) => sum + e.itemPrice, 0);
+  let barTotal = 0, bar0 = 0, bar25 = 0;
+  barTallyEntriesForOffer.forEach((e) => {
+    barTotal += e.itemPrice;
+    const material = e.itemType === "material" && e.refId ? data.materials.find((m) => m.id === e.refId) : undefined;
+    // Eldre/uklassifiserte kasse-oppføringer (mangler kobling til en konkret råvare) regnes som mat (15%) - trygg standard.
+    const rate = material ? vatRateForMaterialCategory(material.category, data) : 15;
+    if (rate === 0) bar0 += e.itemPrice;
+    else if (rate === 25) bar25 += e.itemPrice;
+  });
+  const share0 = barTotal > 0 ? bar0 / barTotal : 0;
+  const share25 = barTotal > 0 ? bar25 / barTotal : 0;
   const effectiveBarTotal = rental.barLocked ? (rental.barLockedTotal || 0) : barTotal;
-  const foodDrinkBasis = food + effectiveBarTotal;
-  const revenueCut = foodDrinkBasis * (partner.revenueSharePercent || 0) / 100;
+  const effectiveBar0 = effectiveBarTotal * share0;
+  const effectiveBar25 = effectiveBarTotal * share25;
+  const effectiveBar15 = effectiveBarTotal - effectiveBar0 - effectiveBar25;
+  const basis0 = effectiveBar0;
+  const basis15 = matFromMenu + effectiveBar15;
+  const basis25 = effectiveBar25;
+  const foodDrinkBasis = basis0 + basis15 + basis25;
+  const pct = (partner.revenueSharePercent || 0) / 100;
+  const revenueCut0 = basis0 * pct;
+  const revenueCut15 = basis15 * pct;
+  const revenueCut25 = basis25 * pct;
+  const revenueCut = revenueCut0 + revenueCut15 + revenueCut25;
   const venueFee = (partner.venueFees || {})[venue.id] ?? partner.venueFeeFixedAmount ?? 0;
-  return { partner, venueFee, foodDrinkBasis, revenueCut, total: venueFee + revenueCut };
+  const venueFeeVatRate = (partner.venueFeeVatRates || {})[venue.id] ?? 25;
+  return { partner, venueFee, venueFeeVatRate, basis0, basis15, basis25, foodDrinkBasis, revenueCut0, revenueCut15, revenueCut25, revenueCut, total: venueFee + revenueCut };
 }
 
 // Rapport-kort for Rapporter-fanen: velg samarbeidspartner, se alle leietilbud markert "Slått inn" i
@@ -22931,45 +22980,102 @@ function CommissionPartnerReport({ data, month, readOnly }: { data: AppData; mon
   const [partnerId, setPartnerId] = useState(partners[0]?.id || "");
   const partner = partners.find((p) => p.id === partnerId);
 
-  const rows = useMemo(() => {
-    if (!partner) return [];
-    return (data.rentalOffers || [])
-      .filter((o) => !!o.rungInName && (o.date || "").slice(0, 7) === month)
-      .map((o) => ({ offer: o, calc: commissionForRental(o, data) }))
-      .filter((r): r is { offer: RentalOffer; calc: NonNullable<ReturnType<typeof commissionForRental>> } => !!r.calc && r.calc.partner.id === partner.id)
-      .sort((a, b) => (a.offer.date || "").localeCompare(b.offer.date || ""));
-  }, [data, month, partner]);
+  const rowsByPartner = useMemo(() => {
+    const confirmedOffers = (data.rentalOffers || []).filter((o) => !!o.rungInName && (o.date || "").slice(0, 7) === month);
+    const map = new Map<string, { offer: RentalOffer; calc: NonNullable<ReturnType<typeof commissionForRental>> }[]>();
+    confirmedOffers.forEach((o) => {
+      const calc = commissionForRental(o, data);
+      if (!calc) return;
+      const list = map.get(calc.partner.id) || [];
+      list.push({ offer: o, calc });
+      map.set(calc.partner.id, list);
+    });
+    map.forEach((list) => list.sort((a, b) => (a.offer.date || "").localeCompare(b.offer.date || "")));
+    return map;
+  }, [data, month]);
+
+  const rows = partner ? (rowsByPartner.get(partner.id) || []) : [];
+  const hasAnyRows = Array.from(rowsByPartner.values()).some((list) => list.length > 0);
 
   const sumRevenueCut = rows.reduce((sum, r) => sum + r.calc.revenueCut, 0);
   const sumTotal = rows.reduce((sum, r) => sum + r.calc.total, 0);
 
-  async function exportPartnerXlsx() {
-    if (!partner) return;
+  // Samlet nedlasting for HELE måneden - én "Oversikt"-fane som oppsummerer alle partnere,
+  // pluss ett eget ark pr. partner med full nedbrytning (grunnlag og kutt for 0/15/25% mva hver for seg).
+  async function exportAllPartnersXlsx() {
     const ExcelJS = await import("exceljs");
     const wb = new ExcelJS.Workbook();
-    const ws = wb.addWorksheet("Rapport");
-    ws.columns = [{ width: 14 }, { width: 28 }, { width: 22 }, { width: 14 }, { width: 14 }, { width: 16 }, { width: 16 }, { width: 16 }];
-    const titleRow = ws.addRow([`${partner.name} – ${month}`]);
-    ws.mergeCells(1, 1, 1, 8);
+    const usedSheetNames = new Set<string>();
+    function sheetNameFor(name: string, id: string) {
+      const base = (name || id).replace(/[\\/*?:[\]]/g, "").slice(0, 28).trim() || id.slice(0, 28);
+      let candidate = base;
+      let n = 2;
+      while (usedSheetNames.has(candidate)) { candidate = `${base} (${n})`; n++; }
+      usedSheetNames.add(candidate);
+      return candidate;
+    }
+
+    const overview = wb.addWorksheet(sheetNameFor("Oversikt", "oversikt"));
+    overview.columns = [{ width: 28 }, { width: 16 }, { width: 16 }, { width: 16 }, { width: 18 }];
+    const titleRow = overview.addRow([`Samarbeidspartnere – ${month}`]);
+    overview.mergeCells(1, 1, 1, 5);
     titleRow.getCell(1).font = { bold: true, size: 14, color: { argb: "FFFFFFFF" } };
     titleRow.getCell(1).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF166534" } };
     titleRow.getCell(1).alignment = { horizontal: "center", vertical: "middle" };
     titleRow.height = 28;
-    ws.addRow([]);
-    const headerRow = ws.addRow(["Dato", "Kunde", "Lokale", "Leiepris", "Fast beløp", "Mat+drikke", `Kutt (${partner.revenueSharePercent}%)`, "Sum til partner"]);
-    headerRow.eachCell((cell: any) => { cell.font = { bold: true, color: { argb: "FFFFFFFF" } }; cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF166534" } }; cell.border = { top: { style: "thin" }, bottom: { style: "thin" }, left: { style: "thin" }, right: { style: "thin" } }; });
-    rows.forEach((r) => {
-      const row = ws.addRow([formatDateNo(r.offer.date || ""), r.offer.customer, r.offer.venue, r.offer.venuePrice, r.calc.venueFee, r.calc.foodDrinkBasis, r.calc.revenueCut, r.calc.total]);
-      row.eachCell((cell: any, colNumber: number) => { cell.border = { top: { style: "hair" }, bottom: { style: "hair" }, left: { style: "thin" }, right: { style: "thin" } }; if (colNumber >= 4) cell.numFmt = "#,##0.00"; });
+    overview.addRow([]);
+    const overviewHeader = overview.addRow(["Samarbeidspartner", "Antall bookinger", "Fast beløp", "Kutt (totalt)", "Sum til partner"]);
+    overviewHeader.eachCell((cell: any) => { cell.font = { bold: true, color: { argb: "FFFFFFFF" } }; cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF166534" } }; cell.border = { top: { style: "thin" }, bottom: { style: "thin" }, left: { style: "thin" }, right: { style: "thin" } }; });
+    let grandFee = 0, grandCut = 0, grandTotal = 0;
+    partners.forEach((p) => {
+      const list = rowsByPartner.get(p.id) || [];
+      if (list.length === 0) return;
+      const sumFee = list.reduce((s, r) => s + r.calc.venueFee, 0);
+      const sumCut = list.reduce((s, r) => s + r.calc.revenueCut, 0);
+      const sumPartnerTotal = list.reduce((s, r) => s + r.calc.total, 0);
+      grandFee += sumFee; grandCut += sumCut; grandTotal += sumPartnerTotal;
+      const row = overview.addRow([p.name, list.length, sumFee, sumCut, sumPartnerTotal]);
+      row.eachCell((cell: any, colNumber: number) => { cell.border = { top: { style: "hair" }, bottom: { style: "hair" }, left: { style: "thin" }, right: { style: "thin" } }; if (colNumber >= 3) cell.numFmt = "#,##0.00"; });
     });
-    const sumRow = ws.addRow(["SUM", "", "", "", "", "", sumRevenueCut, sumTotal]);
-    sumRow.eachCell((cell: any, colNumber: number) => { cell.font = { bold: true }; cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "44166534" } }; cell.border = { top: { style: "medium" }, bottom: { style: "medium" }, left: { style: "medium" }, right: { style: "medium" } }; if (colNumber >= 4) cell.numFmt = "#,##0.00"; });
+    const overviewSumRow = overview.addRow(["SUM", "", grandFee, grandCut, grandTotal]);
+    overviewSumRow.eachCell((cell: any, colNumber: number) => { cell.font = { bold: true }; cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "44166534" } }; cell.border = { top: { style: "medium" }, bottom: { style: "medium" }, left: { style: "medium" }, right: { style: "medium" } }; if (colNumber >= 3) cell.numFmt = "#,##0.00"; });
+
+    partners.forEach((p) => {
+      const list = rowsByPartner.get(p.id) || [];
+      if (list.length === 0) return;
+      const ws = wb.addWorksheet(sheetNameFor(p.name, p.id));
+      ws.columns = [{ width: 12 }, { width: 24 }, { width: 20 }, { width: 13 }, { width: 15 }, { width: 12 }, { width: 12 }, { width: 12 }, { width: 12 }, { width: 12 }, { width: 12 }, { width: 12 }, { width: 15 }];
+      const wsTitle = ws.addRow([`${p.name} – ${month}`]);
+      ws.mergeCells(1, 1, 1, 13);
+      wsTitle.getCell(1).font = { bold: true, size: 14, color: { argb: "FFFFFFFF" } };
+      wsTitle.getCell(1).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF166534" } };
+      wsTitle.getCell(1).alignment = { horizontal: "center", vertical: "middle" };
+      wsTitle.height = 28;
+      ws.addRow([]);
+      const header = ws.addRow(["Dato", "Kunde", "Lokale", "Leiepris", "Fast beløp (eks.mva)", "Mva-sats fast beløp", "Grunnlag 0%", "Grunnlag 15%", "Grunnlag 25%", `Kutt 0% (${p.revenueSharePercent}%)`, `Kutt 15% (${p.revenueSharePercent}%)`, `Kutt 25% (${p.revenueSharePercent}%)`, "Sum til partner (eks.mva)"]);
+      header.eachCell((cell: any) => { cell.font = { bold: true, color: { argb: "FFFFFFFF" } }; cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF166534" } }; cell.border = { top: { style: "thin" }, bottom: { style: "thin" }, left: { style: "thin" }, right: { style: "thin" } }; });
+      list.forEach((r) => {
+        const row = ws.addRow([formatDateNo(r.offer.date || ""), r.offer.customer, r.offer.venue, r.offer.venuePrice, r.calc.venueFee, `${r.calc.venueFeeVatRate}%`, r.calc.basis0, r.calc.basis15, r.calc.basis25, r.calc.revenueCut0, r.calc.revenueCut15, r.calc.revenueCut25, r.calc.total]);
+        row.eachCell((cell: any, colNumber: number) => { cell.border = { top: { style: "hair" }, bottom: { style: "hair" }, left: { style: "thin" }, right: { style: "thin" } }; if (colNumber >= 4 && colNumber !== 6) cell.numFmt = "#,##0.00"; });
+      });
+      const sFee = list.reduce((s, r) => s + r.calc.venueFee, 0);
+      const s0 = list.reduce((s, r) => s + r.calc.basis0, 0);
+      const s15 = list.reduce((s, r) => s + r.calc.basis15, 0);
+      const s25 = list.reduce((s, r) => s + r.calc.basis25, 0);
+      const sCut0 = list.reduce((s, r) => s + r.calc.revenueCut0, 0);
+      const sCut15 = list.reduce((s, r) => s + r.calc.revenueCut15, 0);
+      const sCut25 = list.reduce((s, r) => s + r.calc.revenueCut25, 0);
+      const sTotal = list.reduce((s, r) => s + r.calc.total, 0);
+      const sr = ws.addRow(["SUM", "", "", "", sFee, "", s0, s15, s25, sCut0, sCut15, sCut25, sTotal]);
+      sr.eachCell((cell: any, colNumber: number) => { cell.font = { bold: true }; cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "44166534" } }; cell.border = { top: { style: "medium" }, bottom: { style: "medium" }, left: { style: "medium" }, right: { style: "medium" } }; if (colNumber >= 4 && colNumber !== 6) cell.numFmt = "#,##0.00"; });
+    });
+
     const buffer = await wb.xlsx.writeBuffer();
     const blob = new Blob([buffer], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `${idFromName(partner.name)}-${month}.xlsx`;
+    a.download = `samarbeidspartnere-${month}.xlsx`;
     a.click();
     URL.revokeObjectURL(url);
   }
@@ -23030,7 +23136,7 @@ function CommissionPartnerReport({ data, month, readOnly }: { data: AppData; mon
             </tfoot>
           )}
         </table>
-        <button className="btn active" style={{ marginTop: 12 }} disabled={readOnly || rows.length === 0} onClick={exportPartnerXlsx}>Last ned Excel</button>
+        <button className="btn active" style={{ marginTop: 12 }} disabled={readOnly || !hasAnyRows} onClick={exportAllPartnersXlsx}>Last ned samlet rapport (alle partnere, med forside)</button>
       </div>
     </details>
   );
@@ -24466,18 +24572,35 @@ function removeBarTemplateItem(templateId: string, itemId: string) {
                           {v.name}
                         </button>
                         {active && (
-                          <input
-                            type="number"
-                            value={(partner.venueFees || {})[v.id] ?? partner.venueFeeFixedAmount ?? 0}
-                            onChange={(e) => {
-                              const venueFees = { ...(partner.venueFees || {}), [v.id]: Number(e.target.value) || 0 };
-                              setLocalPartners(localPartners.map((x, ix) => ix === i ? { ...x, venueFees } : x));
-                            }}
-                            onBlur={() => updateData({ commissionPartners: localPartners })}
-                            disabled={readOnly}
-                            title={`Fast beløp for ${v.name}`}
-                            style={{ width: 90, fontSize: 12 }}
-                          />
+                          <>
+                            <input
+                              type="number"
+                              value={(partner.venueFees || {})[v.id] ?? partner.venueFeeFixedAmount ?? 0}
+                              onChange={(e) => {
+                                const venueFees = { ...(partner.venueFees || {}), [v.id]: Number(e.target.value) || 0 };
+                                setLocalPartners(localPartners.map((x, ix) => ix === i ? { ...x, venueFees } : x));
+                              }}
+                              onBlur={() => updateData({ commissionPartners: localPartners })}
+                              disabled={readOnly}
+                              title={`Fast beløp (eks. mva) for ${v.name}`}
+                              style={{ width: 90, fontSize: 12 }}
+                            />
+                            <select
+                              value={(partner.venueFeeVatRates || {})[v.id] ?? 25}
+                              disabled={readOnly}
+                              title={`Mva-sats på fast beløp for ${v.name}`}
+                              style={{ fontSize: 12 }}
+                              onChange={(e) => {
+                                const venueFeeVatRates = { ...(partner.venueFeeVatRates || {}), [v.id]: Number(e.target.value) as 15 | 25 };
+                                const next = localPartners.map((x, ix) => ix === i ? { ...x, venueFeeVatRates } : x);
+                                setLocalPartners(next);
+                                updateData({ commissionPartners: next });
+                              }}
+                            >
+                              <option value={15}>15%</option>
+                              <option value={25}>25%</option>
+                            </select>
+                          </>
                         )}
                       </div>
                     );
@@ -24779,12 +24902,33 @@ function removeBarTemplateItem(templateId: string, itemId: string) {
       </Section>
 
       <Section id="materialCats" title="Kategorier for råvarer">
+        <p className="muted" style={{ fontSize: 13 }}>Momssatsen bak hver kategori brukes bl.a. til mat/drikke-fordelingen i Samarbeidspartner-rapporten. Standard er 25% for Øl/Vin/Brennevin/Cider og 15% for resten, med mindre du velger noe annet.</p>
         <CategoryEditor
           values={data.materialCategories}
           newValue={newMaterialCategory}
           setNewValue={setNewMaterialCategory}
           onSave={(next) => updateData({ materialCategories: next })}
           disabled={readOnly}
+          renderExtra={(cat) => {
+            const defaultRate = ["Øl", "Vin", "Brennevin", "Cider"].includes(cat) ? 25 : 15;
+            return (
+              <select
+                value={localSettings.vatRateByCategory?.[cat] ?? defaultRate}
+                disabled={readOnly}
+                title={`Momssats for ${cat}`}
+                style={{ width: 70, fontSize: 12 }}
+                onChange={(e) => {
+                  const next = { ...localSettings, vatRateByCategory: { ...(localSettings.vatRateByCategory || {}), [cat]: Number(e.target.value) as 0 | 15 | 25 } };
+                  setLocalSettings(next);
+                  updateData({ settings: next });
+                }}
+              >
+                <option value={0}>0%</option>
+                <option value={15}>15%</option>
+                <option value={25}>25%</option>
+              </select>
+            );
+          }}
         />
       </Section>
 
@@ -24858,7 +25002,7 @@ function removeBarTemplateItem(templateId: string, itemId: string) {
   );
 });
 
-function CategoryEditor({ values, newValue, setNewValue, onSave, disabled }: { values: string[]; newValue: string; setNewValue: (v: string) => void; onSave: (next: string[]) => void; disabled?: boolean }) {
+function CategoryEditor({ values, newValue, setNewValue, onSave, disabled, renderExtra }: { values: string[]; newValue: string; setNewValue: (v: string) => void; onSave: (next: string[]) => void; disabled?: boolean; renderExtra?: (value: string) => React.ReactNode }) {
   const [localValues, setLocalValues] = useState(values);
 
   return (
@@ -24872,6 +25016,7 @@ function CategoryEditor({ values, newValue, setNewValue, onSave, disabled }: { v
               onChange={(e) => setLocalValues(localValues.map((x, ix) => ix === i ? e.target.value : x))}
               onBlur={() => onSave(localValues)}
             />
+            {renderExtra && renderExtra(v)}
             <button className="link danger" disabled={disabled} title={disabled ? "Du har ikke redigeringstilgang" : undefined} onClick={() => {
               const next = localValues.filter((_, ix) => ix !== i);
               setLocalValues(next);
