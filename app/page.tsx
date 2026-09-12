@@ -22930,10 +22930,12 @@ function commissionForRental(rental: RentalOffer, data: AppData): {
   basis15: number;
   basis25: number;
   foodDrinkBasis: number;
+  foodDrinkBasisEx: number;
   revenueCut0: number;
   revenueCut15: number;
   revenueCut25: number;
   revenueCut: number;
+  revenueCutEx: number;
   total: number;
 } | null {
   if (rental.venueExternal || !rental.venue) return null;
@@ -22968,9 +22970,16 @@ function commissionForRental(rental: RentalOffer, data: AppData): {
   const revenueCut15 = basis15 * pct;
   const revenueCut25 = basis25 * pct;
   const revenueCut = revenueCut0 + revenueCut15 + revenueCut25;
+  // Informativt: samme kutt regnet av NETTOSALG (eks. mva) i stedet for bruttosalg (kundepriser inkluderer
+  // alltid mva i appen) - vises ved siden av det ordinære, brutto-baserte kuttet i rapporten og Excel-eksporten,
+  // men brukes IKKE i "total"/"Sum til partner" (den beholder samme brutto-baserte formel som før - se BAKGRUNN).
+  const basis15Ex = exVatFromIncVat(basis15, 15);
+  const basis25Ex = exVatFromIncVat(basis25, 25);
+  const foodDrinkBasisEx = basis0 + basis15Ex + basis25Ex;
+  const revenueCutEx = foodDrinkBasisEx * pct;
   const venueFee = (partner.venueFees || {})[venue.id] ?? partner.venueFeeFixedAmount ?? 0;
   const venueFeeVatRate = (partner.venueFeeVatRates || {})[venue.id] ?? 25;
-  return { partner, venueFee, venueFeeVatRate, basis0, basis15, basis25, foodDrinkBasis, revenueCut0, revenueCut15, revenueCut25, revenueCut, total: venueFee + revenueCut };
+  return { partner, venueFee, venueFeeVatRate, basis0, basis15, basis25, foodDrinkBasis, foodDrinkBasisEx, revenueCut0, revenueCut15, revenueCut25, revenueCut, revenueCutEx, total: venueFee + revenueCut };
 }
 
 type RentalLineItem = { category: string; description: string; qty: number; unitPriceInc: number; sumInc: number; vatRate: 0 | 15 | 25; sumEx: number };
@@ -23041,29 +23050,30 @@ function rentalLineItems(rental: RentalOffer, data: AppData): RentalLineItem[] {
 // Delt "forside"-ark (oppsummering av ALLE samarbeidspartnere for måneden) - brukes av både
 // "last ned alle partnere"- og "last ned for valgt partner"-eksporten under, slik at begge filene
 // alltid har samme forside.
-function fillOverviewSheet(ws: any, partners: CommissionPartner[], rowsByPartner: Map<string, { offer: RentalOffer; calc: NonNullable<ReturnType<typeof commissionForRental>> }[]>, month: string) {
-  ws.columns = [{ width: 28 }, { width: 16 }, { width: 16 }, { width: 16 }, { width: 18 }];
-  const titleRow = ws.addRow([`Samarbeidspartnere – ${month}`]);
-  ws.mergeCells(1, 1, 1, 5);
+function fillOverviewSheet(ws: any, partners: CommissionPartner[], rowsByPartner: Map<string, { offer: RentalOffer; calc: NonNullable<ReturnType<typeof commissionForRental>> }[]>, periodLabel: string) {
+  ws.columns = [{ width: 28 }, { width: 16 }, { width: 16 }, { width: 16 }, { width: 18 }, { width: 18 }];
+  const titleRow = ws.addRow([`Samarbeidspartnere – ${periodLabel}`]);
+  ws.mergeCells(1, 1, 1, 6);
   titleRow.getCell(1).font = { bold: true, size: 14, color: { argb: "FFFFFFFF" } };
   titleRow.getCell(1).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF166534" } };
   titleRow.getCell(1).alignment = { horizontal: "center", vertical: "middle" };
   titleRow.height = 28;
   ws.addRow([]);
-  const overviewHeader = ws.addRow(["Samarbeidspartner", "Antall bookinger", "Fast beløp", "Kutt (totalt)", "Sum til partner"]);
+  const overviewHeader = ws.addRow(["Samarbeidspartner", "Antall bookinger", "Fast beløp", "Kutt (totalt, brutto)", "Kutt (totalt, eks.mva)", "Sum til partner"]);
   overviewHeader.eachCell((cell: any) => { cell.font = { bold: true, color: { argb: "FFFFFFFF" } }; cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF166534" } }; cell.border = { top: { style: "thin" }, bottom: { style: "thin" }, left: { style: "thin" }, right: { style: "thin" } }; });
-  let grandFee = 0, grandCut = 0, grandTotal = 0;
+  let grandFee = 0, grandCut = 0, grandCutEx = 0, grandTotal = 0;
   partners.forEach((p) => {
     const list = rowsByPartner.get(p.id) || [];
     if (list.length === 0) return;
     const sumFee = list.reduce((s, r) => s + r.calc.venueFee, 0);
     const sumCut = list.reduce((s, r) => s + r.calc.revenueCut, 0);
+    const sumCutEx = list.reduce((s, r) => s + r.calc.revenueCutEx, 0);
     const sumPartnerTotal = list.reduce((s, r) => s + r.calc.total, 0);
-    grandFee += sumFee; grandCut += sumCut; grandTotal += sumPartnerTotal;
-    const row = ws.addRow([p.name, list.length, sumFee, sumCut, sumPartnerTotal]);
+    grandFee += sumFee; grandCut += sumCut; grandCutEx += sumCutEx; grandTotal += sumPartnerTotal;
+    const row = ws.addRow([p.name, list.length, sumFee, sumCut, sumCutEx, sumPartnerTotal]);
     row.eachCell((cell: any, colNumber: number) => { cell.border = { top: { style: "hair" }, bottom: { style: "hair" }, left: { style: "thin" }, right: { style: "thin" } }; if (colNumber >= 3) cell.numFmt = "#,##0.00"; });
   });
-  const overviewSumRow = ws.addRow(["SUM", "", grandFee, grandCut, grandTotal]);
+  const overviewSumRow = ws.addRow(["SUM", "", grandFee, grandCut, grandCutEx, grandTotal]);
   overviewSumRow.eachCell((cell: any, colNumber: number) => { cell.font = { bold: true }; cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "44166534" } }; cell.border = { top: { style: "medium" }, bottom: { style: "medium" }, left: { style: "medium" }, right: { style: "medium" } }; if (colNumber >= 3) cell.numFmt = "#,##0.00"; });
 }
 
@@ -23071,42 +23081,50 @@ function fillOverviewSheet(ws: any, partners: CommissionPartner[], rowsByPartner
 // etterfulgt av én uthevet "PARTNERBETALING"-rad med fast beløp/kutt/sum til partner for
 // akkurat den bookingen. Brukes av både "last ned alle partnere"- og
 // "last ned for valgt partner"-eksporten under.
-function fillPartnerDetailSheet(ws: any, p: CommissionPartner, list: { offer: RentalOffer; calc: NonNullable<ReturnType<typeof commissionForRental>> }[], month: string, data: AppData) {
-  ws.columns = [{ width: 12 }, { width: 22 }, { width: 20 }, { width: 16 }, { width: 30 }, { width: 10 }, { width: 16 }, { width: 14 }, { width: 11 }, { width: 14 }, { width: 20 }, { width: 18 }, { width: 20 }];
-  const wsTitle = ws.addRow([`${p.name} – ${month}`]);
-  ws.mergeCells(1, 1, 1, 13);
+function fillPartnerDetailSheet(ws: any, p: CommissionPartner, list: { offer: RentalOffer; calc: NonNullable<ReturnType<typeof commissionForRental>> }[], periodLabel: string, data: AppData) {
+  ws.columns = [{ width: 12 }, { width: 22 }, { width: 20 }, { width: 16 }, { width: 30 }, { width: 10 }, { width: 16 }, { width: 14 }, { width: 11 }, { width: 14 }, { width: 20 }, { width: 18 }, { width: 20 }, { width: 20 }];
+  const wsTitle = ws.addRow([`${p.name} – ${periodLabel}`]);
+  ws.mergeCells(1, 1, 1, 14);
   wsTitle.getCell(1).font = { bold: true, size: 14, color: { argb: "FFFFFFFF" } };
   wsTitle.getCell(1).fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF166534" } };
   wsTitle.getCell(1).alignment = { horizontal: "center", vertical: "middle" };
   wsTitle.height = 28;
   ws.addRow([]);
-  const header = ws.addRow(["Dato", "Kunde", "Lokale", "Kategori", "Beskrivelse", "Antall", "Pris/enhet (inkl.mva)", "Sum (inkl.mva)", "Mva-sats", "Sum (eks.mva)", "Fast beløp til partner (eks.mva)", `Kutt (${p.revenueSharePercent}% av mat/drikke)`, "Sum til partner (eks.mva)"]);
+  const header = ws.addRow(["Dato", "Kunde", "Lokale", "Kategori", "Beskrivelse", "Antall", "Pris/enhet (inkl.mva)", "Sum (inkl.mva)", "Mva-sats", "Sum (eks.mva)", "Fast beløp til partner (eks.mva)", `Kutt (${p.revenueSharePercent}% av mat/drikke, brutto)`, `Kutt (${p.revenueSharePercent}%, eks.mva)`, "Sum til partner (eks.mva)"]);
   header.eachCell((cell: any) => { cell.font = { bold: true, color: { argb: "FFFFFFFF" } }; cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF166534" } }; cell.border = { top: { style: "thin" }, bottom: { style: "thin" }, left: { style: "thin" }, right: { style: "thin" } }; });
   let grandSumToPartner = 0;
   list.forEach((r) => {
     const items = rentalLineItems(r.offer, data);
     const dateLabel = formatDateNo(r.offer.date || "");
     items.forEach((item) => {
-      const row = ws.addRow([dateLabel, r.offer.customer, r.offer.venue, item.category, item.description, item.qty, item.unitPriceInc, item.sumInc, `${item.vatRate}%`, item.sumEx, "", "", ""]);
+      const row = ws.addRow([dateLabel, r.offer.customer, r.offer.venue, item.category, item.description, item.qty, item.unitPriceInc, item.sumInc, `${item.vatRate}%`, item.sumEx, "", "", "", ""]);
       row.eachCell((cell: any, colNumber: number) => { cell.border = { top: { style: "hair" }, bottom: { style: "hair" }, left: { style: "thin" }, right: { style: "thin" } }; if ([7, 8, 10].includes(colNumber)) cell.numFmt = "#,##0.00"; });
     });
-    const summary = ws.addRow([dateLabel, r.offer.customer, r.offer.venue, "PARTNERBETALING", `Fast beløp + ${p.revenueSharePercent}% av mat/drikke`, "", "", "", "", "", r.calc.venueFee, r.calc.revenueCut, r.calc.total]);
-    summary.eachCell((cell: any, colNumber: number) => { cell.font = { italic: true, bold: true }; cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFF1F5F9" } }; cell.border = { top: { style: "thin" }, bottom: { style: "thin" }, left: { style: "thin" }, right: { style: "thin" } }; if ([11, 12, 13].includes(colNumber)) cell.numFmt = "#,##0.00"; });
+    const summary = ws.addRow([dateLabel, r.offer.customer, r.offer.venue, "PARTNERBETALING", `Fast beløp + ${p.revenueSharePercent}% av mat/drikke`, "", "", "", "", "", r.calc.venueFee, r.calc.revenueCut, r.calc.revenueCutEx, r.calc.total]);
+    summary.eachCell((cell: any, colNumber: number) => { cell.font = { italic: true, bold: true }; cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FFF1F5F9" } }; cell.border = { top: { style: "thin" }, bottom: { style: "thin" }, left: { style: "thin" }, right: { style: "thin" } }; if ([11, 12, 13, 14].includes(colNumber)) cell.numFmt = "#,##0.00"; });
     grandSumToPartner += r.calc.total;
   });
-  const sumRow = ws.addRow(["SUM", "", "", "", "", "", "", "", "", "", "", "", grandSumToPartner]);
-  sumRow.eachCell((cell: any, colNumber: number) => { cell.font = { bold: true }; cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "44166534" } }; cell.border = { top: { style: "medium" }, bottom: { style: "medium" }, left: { style: "medium" }, right: { style: "medium" } }; if (colNumber === 13) cell.numFmt = "#,##0.00"; });
+  const sumRow = ws.addRow(["SUM", "", "", "", "", "", "", "", "", "", "", "", "", grandSumToPartner]);
+  sumRow.eachCell((cell: any, colNumber: number) => { cell.font = { bold: true }; cell.fill = { type: "pattern", pattern: "solid", fgColor: { argb: "44166534" } }; cell.border = { top: { style: "medium" }, bottom: { style: "medium" }, left: { style: "medium" }, right: { style: "medium" } }; if (colNumber === 14) cell.numFmt = "#,##0.00"; });
 }
 
 // Rapport-kort for Rapporter-fanen: velg samarbeidspartner, se alle leietilbud markert "Slått inn" i
 // valgt måned for lokaler koblet til den partneren, med sumlinje og Excel-nedlasting.
-function CommissionPartnerReport({ data, month, readOnly }: { data: AppData; month: string; readOnly: boolean }) {
+function CommissionPartnerReport({ data, readOnly }: { data: AppData; readOnly: boolean }) {
   const partners = data.commissionPartners || [];
   const [partnerId, setPartnerId] = useState(partners[0]?.id || "");
   const partner = partners.find((p) => p.id === partnerId);
 
+  const defaultMonth = new Date().toISOString().slice(0, 7);
+  const [fromMonth, setFromMonth] = useState(defaultMonth);
+  const [toMonth, setToMonth] = useState(defaultMonth);
+  const periodLabel = fromMonth === toMonth ? fromMonth : `${fromMonth} – ${toMonth}`;
+
   const rowsByPartner = useMemo(() => {
-    const confirmedOffers = (data.rentalOffers || []).filter((o) => !!o.rungInName && (o.date || "").slice(0, 7) === month);
+    const confirmedOffers = (data.rentalOffers || []).filter((o) => {
+      const offerMonth = (o.date || "").slice(0, 7);
+      return !!o.rungInName && offerMonth >= fromMonth && offerMonth <= toMonth;
+    });
     const map = new Map<string, { offer: RentalOffer; calc: NonNullable<ReturnType<typeof commissionForRental>> }[]>();
     confirmedOffers.forEach((o) => {
       const calc = commissionForRental(o, data);
@@ -23117,12 +23135,13 @@ function CommissionPartnerReport({ data, month, readOnly }: { data: AppData; mon
     });
     map.forEach((list) => list.sort((a, b) => (a.offer.date || "").localeCompare(b.offer.date || "")));
     return map;
-  }, [data, month]);
+  }, [data, fromMonth, toMonth]);
 
   const rows = partner ? (rowsByPartner.get(partner.id) || []) : [];
   const hasAnyRows = Array.from(rowsByPartner.values()).some((list) => list.length > 0);
 
   const sumRevenueCut = rows.reduce((sum, r) => sum + r.calc.revenueCut, 0);
+  const sumRevenueCutEx = rows.reduce((sum, r) => sum + r.calc.revenueCutEx, 0);
   const sumTotal = rows.reduce((sum, r) => sum + r.calc.total, 0);
 
   function sheetNameHelper(usedSheetNames: Set<string>) {
@@ -23136,31 +23155,31 @@ function CommissionPartnerReport({ data, month, readOnly }: { data: AppData; mon
     };
   }
 
-  // Samlet nedlasting for HELE måneden - én "Oversikt"-fane som oppsummerer alle partnere,
-  // pluss ett eget, linje-for-linje spesifisert ark pr. partner.
+  // Samlet nedlasting for HELE den valgte perioden (kan spenne over flere måneder) - én
+  // "Oversikt"-fane som oppsummerer alle partnere, pluss ett eget, linje-for-linje spesifisert ark pr. partner.
   async function exportAllPartnersXlsx() {
     const ExcelJS = await import("exceljs");
     const wb = new ExcelJS.Workbook();
     const sheetNameFor = sheetNameHelper(new Set<string>());
     const overview = wb.addWorksheet(sheetNameFor("Oversikt", "oversikt"));
-    fillOverviewSheet(overview, partners, rowsByPartner, month);
+    fillOverviewSheet(overview, partners, rowsByPartner, periodLabel);
     partners.forEach((p) => {
       const list = rowsByPartner.get(p.id) || [];
       if (list.length === 0) return;
       const ws = wb.addWorksheet(sheetNameFor(p.name, p.id));
-      fillPartnerDetailSheet(ws, p, list, month, data);
+      fillPartnerDetailSheet(ws, p, list, periodLabel, data);
     });
     const buffer = await wb.xlsx.writeBuffer();
     const blob = new Blob([buffer], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `samarbeidspartnere-${month}.xlsx`;
+    a.download = `samarbeidspartnere-${fromMonth}${toMonth !== fromMonth ? `_${toMonth}` : ""}.xlsx`;
     a.click();
     URL.revokeObjectURL(url);
   }
 
-  // NY: nedlasting for KUN den valgte partneren i nedtrekksmenyen under - samme forside
+  // Nedlasting for KUN den valgte partneren i nedtrekksmenyen under - samme forside
   // (oppsummering av alle selskaper) som den samlede filen, men bare ett detaljark.
   async function exportSelectedPartnerXlsx() {
     if (!partner) return;
@@ -23168,15 +23187,15 @@ function CommissionPartnerReport({ data, month, readOnly }: { data: AppData; mon
     const wb = new ExcelJS.Workbook();
     const sheetNameFor = sheetNameHelper(new Set<string>());
     const overview = wb.addWorksheet(sheetNameFor("Oversikt", "oversikt"));
-    fillOverviewSheet(overview, partners, rowsByPartner, month);
+    fillOverviewSheet(overview, partners, rowsByPartner, periodLabel);
     const ws = wb.addWorksheet(sheetNameFor(partner.name, partner.id));
-    fillPartnerDetailSheet(ws, partner, rows, month, data);
+    fillPartnerDetailSheet(ws, partner, rows, periodLabel, data);
     const buffer = await wb.xlsx.writeBuffer();
     const blob = new Blob([buffer], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `${idFromName(partner.name)}-${month}.xlsx`;
+    a.download = `${idFromName(partner.name)}-${fromMonth}${toMonth !== fromMonth ? `_${toMonth}` : ""}.xlsx`;
     a.click();
     URL.revokeObjectURL(url);
   }
@@ -23195,11 +23214,21 @@ function CommissionPartnerReport({ data, month, readOnly }: { data: AppData; mon
   return (
     <details className="soft-box" style={{ padding: 0 }}>
       <summary style={{ padding: "12px 16px", fontWeight: 800, cursor: "pointer", listStyle: "none", display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-        <span>Samarbeidspartner-rapport ({month})</span>
+        <span>Samarbeidspartner-rapport ({periodLabel})</span>
         <span style={{ color: "#64748b", fontSize: 13 }}>▼</span>
       </summary>
       <div style={{ padding: "0 16px 16px" }}>
-        <p className="muted" style={{ fontSize: 13 }}>Viser leietilbud markert "Slått inn" i valgt måned for lokaler koblet til valgt samarbeidspartner (fast beløp pr. booking + prosentandel av meny + kasse/bar-salg – servitørkostnad og tilleggslinjer holdes utenfor).</p>
+        <p className="muted" style={{ fontSize: 13 }}>Viser leietilbud markert "Slått inn" i valgt periode for lokaler koblet til valgt samarbeidspartner (fast beløp pr. booking + prosentandel av meny + kasse/bar-salg – servitørkostnad og tilleggslinjer holdes utenfor). "Kutt" er regnet av bruttosalg (inkl. mva, slik total-summen alltid har vært); "Kutt (eks.mva)" viser det samme kuttet regnet av nettosalget, til sammenligning.</p>
+        <div style={{ display: "flex", gap: 12, flexWrap: "wrap", marginBottom: 8 }}>
+          <label style={{ display: "block" }}>
+            Fra måned
+            <input type="month" value={fromMonth} onChange={(e) => setFromMonth(e.target.value)} />
+          </label>
+          <label style={{ display: "block" }}>
+            Til måned
+            <input type="month" value={toMonth} onChange={(e) => setToMonth(e.target.value)} />
+          </label>
+        </div>
         <label style={{ display: "block", marginBottom: 8, maxWidth: 260 }}>
           Samarbeidspartner
           <select value={partnerId} onChange={(e) => setPartnerId(e.target.value)}>
@@ -23209,7 +23238,7 @@ function CommissionPartnerReport({ data, month, readOnly }: { data: AppData; mon
         <table>
           <thead>
             <tr>
-              <th>Dato</th><th>Kunde</th><th>Lokale</th><th>Leiepris</th><th>Fast beløp</th><th>Mat+drikke</th><th>Kutt</th><th>Sum til partner</th>
+              <th>Dato</th><th>Kunde</th><th>Lokale</th><th>Leiepris</th><th>Fast beløp</th><th>Mat+drikke</th><th>Kutt</th><th>Kutt (eks.mva)</th><th>Sum til partner</th>
             </tr>
           </thead>
           <tbody>
@@ -23222,16 +23251,18 @@ function CommissionPartnerReport({ data, month, readOnly }: { data: AppData; mon
                 <td>{currency(r.calc.venueFee)}</td>
                 <td>{currency(r.calc.foodDrinkBasis)}</td>
                 <td>{currency(r.calc.revenueCut)}</td>
+                <td>{currency(r.calc.revenueCutEx)}</td>
                 <td><b>{currency(r.calc.total)}</b></td>
               </tr>
             ))}
-            {rows.length === 0 && <tr><td colSpan={8} className="muted">Ingen bekreftede bookinger for denne partneren i valgt måned.</td></tr>}
+            {rows.length === 0 && <tr><td colSpan={9} className="muted">Ingen bekreftede bookinger for denne partneren i valgt periode.</td></tr>}
           </tbody>
           {rows.length > 0 && (
             <tfoot>
               <tr style={{ fontWeight: 800 }}>
                 <td colSpan={6}>SUM</td>
                 <td>{currency(sumRevenueCut)}</td>
+                <td>{currency(sumRevenueCutEx)}</td>
                 <td>{currency(sumTotal)}</td>
               </tr>
             </tfoot>
@@ -24233,7 +24264,7 @@ function ReportsTab({ data, updateData, productUnitCost, updateInventoryRpc, rea
       </div>
 
       <div style={{ marginTop: 16 }}>
-        <CommissionPartnerReport data={data} month={reportMonth} readOnly={readOnly} />
+        <CommissionPartnerReport data={data} readOnly={readOnly} />
       </div>
 
       <div style={{ marginTop: 16 }}>
